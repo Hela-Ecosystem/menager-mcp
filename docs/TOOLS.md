@@ -1,6 +1,6 @@
 # HeLa Ribosome: canonical tools
 
-Server version **3.0.1**. Generated from the ecosystem schema catalog; regenerate with `npm run docs:generate -- --servers` in the ecosystem checkout.
+Server version **3.1.0**. Generated from the ecosystem schema catalog; regenerate with `npm run docs:generate -- --servers` in the ecosystem checkout.
 
 Only names advertised by `tools/list` are listed here. Older aliases in migration examples are not additional tools. Runtime namespace prefixes are optional and do not change these server-local names.
 
@@ -74,7 +74,7 @@ Check opencode CLI availability, version, defined agents, and tracked session co
 
 ## `session_close`
 
-Kills and removes an interactive PTY session managed by this server, freeing its memory.
+Kills and removes an interactive PTY session managed by this server, freeing its memory. SSH sessions backed by tmux also get their remote window killed unless persistOnClose is set.
 
 ## `session_hook`
 
@@ -94,7 +94,7 @@ Force deletes sessions (default: only 'exited' sessions).
 
 ## `session_read`
 
-Reads buffered output from the target session.
+Reads buffered output from the target session: the raw/stripped line buffer ('lines', default) or the rendered terminal screen ('screen').
 
 ## `session_resize`
 
@@ -106,7 +106,7 @@ Sends a POSIX signal to the target session process.
 
 ## `session_spawn`
 
-Spawns a new child PTY session.
+Spawns a new child PTY session, or re-attaches to a tracked one when 'sessionId' names an existing session.
 
 ## `session_wait`
 

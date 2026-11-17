@@ -125,11 +125,20 @@ All errors unified: `isError: true, content: [{text: JSON.stringify({error: ...}
 
 **Shipped (v8):** PTY lifecycle, dual buffers with ANSI re-strip, chunked async `write`, `hook` past+future, `tree-kill` signals, `name`/`cols`/`rows`/`ttlMs`, `prune`/`close`/`resize`/`info`, unified JSON errors, `grep`/`offset` reads, `pressKey` map.
 
+**Shipped since (v3.1.0) — remote rendered PTY, `PTY-01…PTY-16`, no new tools:**
+* **SSH transport (PTY-03/05):** `ssh -t` inside the local `node-pty`, `session_spawn({host, remoteCommand})`, validated argv only, `HELA_RIBOSOME_SSH_HOSTS` exact-match allowlist, `HELA_RIBOSOME_SSH_BIN` seam, `exitKind` separating ssh's own 255 from a remote exit, and `SIGINT` translated to a `^C` byte so the interrupt lands where the work is.
+* **Rendered screen (PTY-01/02):** `src/ScreenBuffer.ts` over a lazily imported, *optional* `@xterm/headless`, fed from the same `onData` stream as the ring buffer. `session_read mode:"screen"` with `includeScrollback` and `settleMs`; `HELA_RIBOSOME_SCREEN=off` or a missing module falls back to the strip-ansi lines. Raw lines stay the truth for hooks and exact-byte reads.
+* **tmux durability (PTY-04):** one cached `tmux -V` probe per host, then `tmux -u set-option -g history-limit <n> \; new-session -A -s hela_<sessionId>`; plain login shell fallback recorded as `tmux.enabled: false` with a reason. `session_spawn({sessionId})` is an idempotent re-attach (viewport reset, local scrollback kept, `[reconnected at <iso>]` injected); `session_close`/shutdown kill the remote window unless `persistOnClose`.
+* **Bounded lifecycle (PTY-12/13):** shutdown awaits `SIGTERM`→`SIGKILL` inside a deadline and reports the ids still alive; `ttlMs` is resolved, clamped and reported.
+* **Env allowlist (PTY-16):** `HELA_RIBOSOME_ENV_ALLOWLIST` filters what a session inherits; unset is the old behaviour.
+* **Evidence harness (PTY-06):** hermetic fake `ssh`, failure injection (transport killed mid-stream, tmux absent, host unreachable, quota exceeded), optional real sshd behind `HELA_RIBOSOME_SSHD_TEST=1`. `npm test` needs no network and no sshd.
+
 **Next:**
-* `session_attach` — re-attach UI, `session_snapshot` → `/tmp/menager-<id>.log`
-* Backpressure feedback (`bytesBuffered` vs `bytesWritten` already implicit via chunking)
-* `strip-ansi` ESM pin, `env` allowlist, per-session metrics (`uptime`, `hookCount`)
-* Vitest suite from the 53 E2E (41 main + 12 prune) + README for breaking changes (`write` now `pressEnter:false` → `\r`, `read` → `getLines`).
+* `session_snapshot` → write a session's full scrollback (or rendered frame) to a file instead of through the response.
+* Backpressure feedback (`bytesBuffered` vs `bytesWritten` already implicit via chunking).
+* Per-session metrics (`uptime`, `hookCount`, bytes in/out) on `session_info`.
+* `strip-ansi` ESM pin — the raw/clean dual buffer still carries a v6 CJS dependency the rendered screen does not need.
+* Re-attach across server restarts: a tmux window outlives the transport today, but the session id lives only in this process's memory, so a restarted server cannot find it again.
 
 ---
 

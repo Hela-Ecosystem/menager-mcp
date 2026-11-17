@@ -92,7 +92,7 @@ function runOpencodeSync(args: string[], cwd?: string, timeoutMs = 15000): { ok:
 const server = new Server(
   {
     name: "menager-mcp",
-    version: "3.0.1",
+    version: "3.1.0",
   },
   {
     capabilities: {
@@ -104,11 +104,13 @@ const server = new Server(
 const TOOLS: Tool[] = [
   {
     name: "session_spawn",
-    description: "Spawns a new child PTY session.",
+    description: "Spawns a new child PTY session, or re-attaches to a tracked one when 'sessionId' names an existing session.",
     inputSchema: {
       type: "object",
       properties: {
         command: { type: "string" },
+        sessionId: { type: "string", description: "Re-use this id. An id already tracked by this server is an idempotent re-attach: the rendered viewport resets, local scrollback is kept, and a '[reconnected at <iso>]' marker is injected. Ignored args on re-attach." },
+        persistOnClose: { type: "boolean", description: "SSH + tmux only: leave the remote tmux window running when the session is closed or the server shuts down (default false)." },
         args: { type: "array", items: { type: "string" } },
         cwd: { type: "string" },
         env: { type: "object", additionalProperties: { type: "string" } },
@@ -118,10 +120,11 @@ const TOOLS: Tool[] = [
         cols: { type: "number", description: "Terminal columns (default 80)" },
         rows: { type: "number", description: "Terminal rows (default 24)" },
         ttlMs: { type: "number", description: "Optional Time-To-Live in milliseconds. Auto-closes session after it exits." },
+        host: { type: "string", description: "Optional [user@]hostname. When set, the session runs the system ssh binary as its transport and 'command' is ignored." },
+        remoteCommand: { type: "array", items: { type: "string" }, description: "Argv to run on the remote host (requires 'host'). Omit for an interactive login shell." },
         run_id: { type: "string", description: "P0-B4: RunStore run id to link this session to" },
         step_id: { type: "string", description: "P0-B4: RunStore step id to link this session to" }
-      },
-      required: ["command"]
+      }
     }
   },
   {
@@ -165,16 +168,19 @@ const TOOLS: Tool[] = [
   },
   {
     name: "session_read",
-    description: "Reads buffered output from the target session.",
+    description: "Reads buffered output from the target session: the raw/stripped line buffer ('lines', default) or the rendered terminal screen ('screen').",
     inputSchema: {
       type: "object",
       properties: {
         sessionId: { type: "string" },
+        mode: { type: "string", enum: ["lines", "screen"], description: "'lines' (default) returns the ring buffer as text. 'screen' returns the @xterm/headless rendered frame as JSON — what a human would see — which is what TUIs, progress bars and full-screen apps actually need." },
         tailLines: { type: "number" },
         stripAnsi: { type: "boolean" },
         clearBuffer: { type: "boolean" },
         offsetLines: { type: "number", description: "Read lines starting from this index" },
-        grepPattern: { type: "string", description: "Filter read lines by regex pattern" }
+        grepPattern: { type: "string", description: "Filter read lines by regex pattern" },
+        includeScrollback: { type: "boolean", description: "screen mode only: include rows that scrolled off the viewport (default false)." },
+        settleMs: { type: "number", description: "screen mode only: wait up to this long for the output stream to go quiet before snapshotting. Immediate by default; a snapshot taken at the cap reports settled:false." }
       },
       required: ["sessionId"]
     }
@@ -196,11 +202,12 @@ const TOOLS: Tool[] = [
   },
   {
     name: "session_close",
-    description: "Kills and removes an interactive PTY session managed by this server, freeing its memory.",
+    description: "Kills and removes an interactive PTY session managed by this server, freeing its memory. SSH sessions backed by tmux also get their remote window killed unless persistOnClose is set.",
     inputSchema: {
       type: "object",
       properties: {
-        sessionId: { type: "string" }
+        sessionId: { type: "string" },
+        persistOnClose: { type: "boolean", description: "SSH + tmux only: keep the remote tmux window alive so a later session_spawn({sessionId}) can re-attach to it." }
       },
       required: ["sessionId"]
     }
@@ -475,10 +482,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     switch (name) {
       case "session_spawn": {
-        const { command, args: cmdArgs = [], cwd = process.cwd(), env = {}, maxBufferLines = 5000, terminalType = 'xterm-256color', name, cols, rows, ttlMs, run_id, step_id } = args as any;
+        const { command, args: cmdArgs = [], cwd = process.cwd(), env = {}, maxBufferLines = 5000, terminalType = 'xterm-256color', name, cols, rows, ttlMs, host, remoteCommand, run_id, step_id, sessionId, persistOnClose } = args as any;
         try {
+          // PTY-04: a known sessionId is an idempotent re-attach, not a new spawn.
+          if (typeof sessionId === 'string' && sessionManager.hasSession(sessionId)) {
+            const info = sessionManager.reattach(sessionId);
+            return { content: [{ type: "text", text: JSON.stringify({ reattached: true, ...info }, null, 2) }] };
+          }
+          if (host === undefined && typeof command !== 'string') {
+            throw new Error("session_spawn requires 'command' for a local session or 'host' for an ssh session");
+          }
+          if (host === undefined && remoteCommand !== undefined) {
+            throw new Error("remoteCommand requires 'host'");
+          }
           const meta = (run_id || step_id) ? { kind: 'pty' as const, run_id: run_id ?? null, step_id: step_id ?? null } : undefined;
-          const info = sessionManager.spawn(command, cmdArgs, cwd, env, maxBufferLines, terminalType, name, cols, rows, ttlMs, meta);
+          const info = sessionManager.spawn(command, cmdArgs, cwd, env, maxBufferLines, terminalType, name, cols, rows, ttlMs, meta, host === undefined ? undefined : { host, remoteCommand }, {
+            sessionId: typeof sessionId === 'string' ? sessionId : undefined,
+            persistOnClose: persistOnClose === true,
+          });
           return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
         } catch (e: any) {
           return { isError: true, content: [{ type: "text", text: JSON.stringify({ error: e.message || String(e) }) }] };
@@ -507,8 +528,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: "text", text: JSON.stringify({ sessionId, bytesWritten: bytes }, null, 2) }] };
       }
       case "session_read": {
-        const { sessionId, tailLines = 100, stripAnsi = true, clearBuffer = false, offsetLines, grepPattern } = args as any;
+        const { sessionId, mode = "lines", tailLines = 100, stripAnsi = true, clearBuffer = false, offsetLines, grepPattern, includeScrollback, settleMs } = args as any;
+        if (mode !== "lines" && mode !== "screen") {
+          return { isError: true, content: [{ type: "text", text: JSON.stringify({ error: "mode must be 'lines' or 'screen'" }) }] };
+        }
+        if (mode === "lines" && includeScrollback !== undefined) {
+          return { isError: true, content: [{ type: "text", text: JSON.stringify({ error: "includeScrollback requires mode 'screen'" }) }] };
+        }
+        if (mode === "lines" && settleMs !== undefined) {
+          return { isError: true, content: [{ type: "text", text: JSON.stringify({ error: "settleMs requires mode 'screen'" }) }] };
+        }
         const session = sessionManager.getSession(sessionId);
+        if (mode === "screen") {
+          const result = await session.readScreen({ includeScrollback: includeScrollback === true, settleMs, tailLines });
+          return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+        }
         const data = session.getLines(tailLines, stripAnsi, clearBuffer, offsetLines, grepPattern);
         return { content: [{ type: "text", text: data }] };
       }
@@ -539,9 +573,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
       }
       case "session_close": {
-        const { sessionId } = args as any;
-        sessionManager.closeSession(sessionId);
-        return { content: [{ type: "text", text: JSON.stringify({ sessionId, closed: true }, null, 2) }] };
+        const { sessionId, persistOnClose } = args as any;
+        const result = sessionManager.closeSession(sessionId, { persistOnClose: persistOnClose === undefined ? undefined : persistOnClose === true });
+        return { content: [{ type: "text", text: JSON.stringify({ ...result, closed: true }, null, 2) }] };
       }
       case "session_signal": {
         const { sessionId, signal } = args as any;
@@ -769,12 +803,17 @@ main().catch((error) => {
   process.exit(1);
 });
 
-process.on("SIGINT", () => {
-  sessionManager.shutdown();
+async function gracefulShutdown() {
+  try {
+    const stuck = await sessionManager.shutdown();
+    if (stuck.length > 0) {
+      console.error(`[MCP] shutdown deadline expired for sessions: ${stuck.join(', ')}`);
+    }
+  } catch (e: any) {
+    console.error(`[MCP] shutdown error: ${e?.message || String(e)}`);
+  }
   process.exit(0);
-});
+}
 
-process.on("SIGTERM", () => {
-  sessionManager.shutdown();
-  process.exit(0);
-});
+process.on("SIGINT", gracefulShutdown);
+process.on("SIGTERM", gracefulShutdown);
