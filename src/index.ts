@@ -9,6 +9,7 @@ import {
 import { spawnSync } from "node:child_process";
 import { SessionManager } from "./SessionManager.js";
 import { buildStatsArgs, opencodeHostEnv } from "./opencode-cli.js";
+import { VERSION } from "./version.js";
 
 const sessionManager = new SessionManager();
 
@@ -92,7 +93,7 @@ function runOpencodeSync(args: string[], cwd?: string, timeoutMs = 15000): { ok:
 const server = new Server(
   {
     name: "menager-mcp",
-    version: "3.1.0",
+    version: VERSION,
   },
   {
     capabilities: {

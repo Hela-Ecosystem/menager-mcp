@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import * as path from 'node:path';
+import { VERSION } from '../build/version.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -81,7 +82,7 @@ test('the advertised tool surface and version are unchanged by PTY-01/02/04', as
   try {
     const init = await client.init();
     assert.equal(init.result.serverInfo.name, 'menager-mcp');
-    assert.equal(init.result.serverInfo.version, '3.1.0');
+    assert.equal(init.result.serverInfo.version, VERSION);
 
     const list = await client.request('tools/list', {});
     const names = list.result.tools.map((t) => t.name).sort();
