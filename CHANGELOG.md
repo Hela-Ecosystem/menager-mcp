@@ -1,3 +1,8 @@
+## [Unreleased]
+
+### Added
+- `npm run test:remote` exercises the ssh transport against a real host: spawn, tmux attach, command round-trip through the rendered screen, idempotent reattach with the reconnect marker, remote kill on close, and a transport-failure exit code. Set `HELA_ITEST_HOST` (default `servy`); it requires key-based ssh and tmux on the target and is not part of `npm test`.
+
 # Changelog
 
 All notable changes to this project.
