@@ -10,6 +10,11 @@
 
 All notable changes to this project.
 
+## [3.1.2] - 2026-11-19
+
+### Changed
+- npm audit fix clears two moderate advisories; PTY behaviour unchanged.
+
 ## [3.1.0] - 2026-11-18
 
 Remote rendered PTY. No tools were added or removed — the surface stays at 28 canonical tools; everything below is new parameters and new reporting on the existing ones.
