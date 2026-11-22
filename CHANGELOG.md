@@ -1,5 +1,10 @@
 ## [Unreleased]
 
+## [3.2.1] - 2026-11-22
+
+### Fixed
+- `opencode_db` is advertised as restricted in its description, matching the ecosystem canonical-boundary check; the wording also points at `hela-genome execute_sql` for memory-database queries.
+
 ## [3.2.0] - 2026-11-22
 
 ### Changed

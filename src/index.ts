@@ -500,7 +500,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "opencode_db",
-    description: "Legacy tool. Direct session database inspection is unsupported on opencode v2.",
+    description: "Legacy tool, restricted: direct session database inspection is unsupported on opencode v2. Use hela-genome execute_sql for the memory database.",
     inputSchema: {
       type: "object",
       properties: {
