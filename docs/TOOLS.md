@@ -10,7 +10,7 @@ Close a tracked agent session, optionally also deleting the opencode session.
 
 ## `agent_create`
 
-Create a new opencode agent file (opencode agent create --path --description --mode --permissions --model). Non-interactive when all of path/description/mode/permissions are given.
+Legacy tool. Agent creation is unsupported on opencode v2.
 
 ## `agent_fork`
 
@@ -38,15 +38,15 @@ List authenticated providers (opencode auth list). Read-only; names only, no sec
 
 ## `opencode_db`
 
-Restricted to OpenCode session database inspection; use hela-genome execute_sql/query_data for the HeLa memory graph. Query the opencode database (opencode db [query]). Read with no query prints the db path context.
+Legacy tool, restricted: direct session database inspection is unsupported on opencode v2. Use hela-genome execute_sql for the memory database.
 
 ## `opencode_export`
 
-Export opencode session data as JSON (opencode export [sessionID]).
+Export opencode session data as JSON (opencode session export <sessionID>).
 
 ## `opencode_import`
 
-Import opencode session data from a JSON file (opencode import <file>).
+Import opencode session data from a JSON file (opencode session import <file>).
 
 ## `opencode_mcp_list`
 
@@ -54,11 +54,11 @@ List configured MCP servers and connection status (opencode mcp list).
 
 ## `opencode_models`
 
-List available models (opencode models [provider] [--refresh] [--verbose]).
+List available models, optionally filtered by provider. Returns up to 50 complete rows and 8000 characters.
 
 ## `opencode_server_spawn`
 
-Spawn a long-running opencode server (serve|web|acp) in a managed PTY so agent_spawn --attach has a warm target and avoids MCP cold boot.
+Spawn a long-running opencode server in a managed PTY. Use its URL as the attach input to agent_spawn.
 
 ## `opencode_session_delete`
 
