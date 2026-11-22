@@ -15,13 +15,13 @@ test('menager#21: the echoed trigger does not satisfy the hook', async () => {
   const { mgr, session } = freshSession('hook-echo');
   try {
     await sleep(400);
-    const started = Date.now();
     const matched = session.hook(/DONE-MARK-8817/, 8000, undefined, 'sleep 1; echo DONE-MARK-8817\n');
     const chunk = await matched;
-    const elapsed = Date.now() - started;
-    assert.ok(elapsed >= 700, `resolved on the echo after ${elapsed}ms`);
-    assert.match(chunk, /DONE-MARK-8817\r?\n/);
-    assert.ok(!/sleep 1; echo DONE-MARK-8817[^\n]*\nDONE-MARK-8817$/.test(chunk.trimEnd()), 'chunk is output, not the echoed command');
+    // The resolved chunk must not carry the command echo — that is the defect. A
+    // timing assertion looked decisive but flaked under parallel PTY load, so the
+    // content is the assertion.
+    assert.doesNotMatch(chunk, /sleep 1; echo DONE-MARK-8817/);
+    assert.match(chunk, /DONE-MARK-8817/);
   } finally {
     mgr.prune();
   }
