@@ -1,5 +1,15 @@
 ## [Unreleased]
 
+## [3.2.0] - 2026-11-22
+
+### Changed
+- `opencode_status` reads the v2 CLI: agents come back as structured ids/modes rather than a usage block, and the command wrappers match opencode 2.x (`session export/import`, `--server` instead of `--attach`, client-side `models` filtering). `db` and `agent create` report `unsupported on opencode v2` instead of running a command that no longer exists. Session ids accept `ses_<alnum>` as well as UUIDs. (`menager-mcp#20`, `#18`)
+- `agent_send` resumes the session it was given. An explicit `sessionId` resolves to that OpenCode session or fails with a hint; only a call without an id continues the latest session, and says `via: "latest"`. Ids are captured from the agent JSON output and persisted. (`menager-mcp#19`)
+
+### Fixed
+- The managed-server password no longer reaches `session_read` or `agent_info`: sessions spawned with redaction buffer lines and replace `server password …` with `[redacted server password]`, including across chunk boundaries. `session_write` on an exited session returns `ok:false` with the exit code; `agent_close` reports whether an OpenCode session was actually deleted and why not; `agent_list` merges per tracked directory; `opencode_models` is bounded to 50 rows / 8000 characters. (`menager-mcp#22`)
+- `session_hook` waits for output instead of matching the terminal echo of `triggerPayload`, and a marker already in the scrollback no longer satisfies a fresh hook. Both are bounded and preserve cross-chunk matching. (`menager-mcp#21`)
+
 ### Fixed
 - Keep the advertised MCP server version in sync with package metadata through a single-source version guard.
 
