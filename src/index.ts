@@ -7,7 +7,8 @@ import {
   Tool
 } from "@modelcontextprotocol/sdk/types.js";
 import { spawnSync } from "node:child_process";
-import { SessionManager } from "./SessionManager.js";
+import { resolve } from "node:path";
+import { SessionExitedError, SessionManager } from "./SessionManager.js";
 import { assertOpencodeSessionId, buildStatsArgs, opencodeHostEnv, opencodeUsageError } from "./opencode-cli.js";
 import { VERSION } from "./version.js";
 
@@ -27,6 +28,8 @@ const OPENCODE_ENV = opencodeHostEnv();
 const AGENT_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
 const MODEL_RE = /^[^/\s]+\/[^/\s]{1,128}$/;
 const MAX_PROMPT = 8000;
+const MAX_MODELS = 50;
+const MAX_MODEL_OUTPUT = 8000;
 
 function assertPrompt(v: unknown): string {
   if (typeof v !== "string" || !v.trim()) throw new Error("prompt/message must be a non-empty string");
@@ -318,7 +321,7 @@ const TOOLS: Tool[] = [
       type: "object",
       properties: {
         includeOpencode: { type: "boolean", description: "Merge opencode session list (default true)" },
-        maxCount: { type: "number", description: "Max opencode sessions to fetch (default 20, max 50)" }
+        maxCount: { type: "number", description: "Max merged opencode sessions across tracked directories (default 20, max 50)" }
       },
       required: []
     }
@@ -373,7 +376,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "opencode_models",
-    description: "List available models, optionally filtered by provider.",
+    description: `List available models, optionally filtered by provider. Returns up to ${MAX_MODELS} complete rows and ${MAX_MODEL_OUTPUT} characters.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -640,21 +643,34 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const runArgs = buildRunArgs({ message, session: opencodeId, fork: true, model: session.meta.model, agent: session.meta.agent });
         const info = sessionManager.spawn(OPENCODE_BIN, runArgs, session.meta.dir || process.cwd(), OPENCODE_ENV, 5000, "xterm-256color", typeof name === "string" ? name : undefined, undefined, undefined, undefined, {
           kind: "agent", agent: session.meta.agent, model: session.meta.model, dir: session.meta.dir,
-          promptPreview: message.slice(0, 200), parentSessionId: sessionId, opencodeSessionId: opencodeId,
+          promptPreview: message.slice(0, 200), parentSessionId: sessionId,
           run_id: session.meta.run_id ?? null, step_id: session.meta.step_id ?? null
         });
         return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
       }
       case "agent_list": {
-        const { includeOpencode = true, maxCount = 20 } = args as any;
-        const tracked = sessionManager.listSessions().filter((s: any) => s.meta?.kind === "agent");
+        const { includeOpencode = true, maxCount = 20 } = args ?? {};
+        const tracked = sessionManager.listSessions().filter(s => s.meta?.kind === "agent");
         if (!includeOpencode) return { content: [{ type: "text", text: JSON.stringify({ tracked }, null, 2) }] };
-        const n = Math.min(Math.max(Number(maxCount) || 20, 1), 50);
-        const r = runOpencodeSync(["session", "list", "--format", "json", "-n", String(n)]);
-        if (!r.ok) return { content: [{ type: "text", text: JSON.stringify({ tracked, opencodeListWarning: (r.stderr || r.error || "session list failed").slice(0, 300) }, null, 2) }] };
-        let sessions: unknown = [];
-        try { sessions = JSON.parse(r.stdout || "[]"); } catch { sessions = []; }
-        return { content: [{ type: "text", text: JSON.stringify({ tracked, opencode: sessions }, null, 2) }] };
+        const n = Math.min(Math.max(Math.floor(Number(maxCount)) || 20, 1), 50);
+        const directories = new Set(tracked.flatMap(s => s.meta?.dir ? [resolve(s.meta.dir)] : []));
+        const sessions = new Map<string, unknown>();
+        let opencodeListWarning: string | undefined;
+        for (const dir of directories) {
+          try {
+            const r = runOpencodeSync(["session", "list", "--format", "json", "-n", String(n)], dir);
+            if (!r.ok) throw new Error(r.stderr.trim() || r.error || "session list failed");
+            const rows: unknown = JSON.parse(r.stdout || "[]");
+            if (!Array.isArray(rows)) throw new Error("expected a session list array");
+            for (const row of rows) {
+              if (typeof row?.id === "string" && !sessions.has(row.id)) sessions.set(row.id, row);
+            }
+          } catch (error) {
+            opencodeListWarning ??= `${dir}: ${error instanceof Error ? error.message : String(error)}`.slice(0, 300);
+          }
+        }
+        const opencode = Array.from(sessions.values()).slice(0, n);
+        return { content: [{ type: "text", text: JSON.stringify({ tracked, opencode, opencodeListWarning }, null, 2) }] };
       }
       case "agent_info": {
         const { sessionId, tailLines = 20 } = args as any;
@@ -666,30 +682,54 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       case "agent_close": {
         const { sessionId, deleteOpencodeSession = false } = args as any;
-        let session: any = null;
-        try { session = sessionManager.getSession(sessionId); } catch { session = null; }
-        const opencodeId = session?.meta?.opencodeSessionId || session?.resolveOpencodeSessionId?.() || null;
-        sessionManager.closeSession(sessionId);
-        if (deleteOpencodeSession && opencodeId) {
-          const r = runOpencodeSync(["session", "delete", opencodeId]);
-          return { content: [{ type: "text", text: JSON.stringify({ sessionId, closed: true, opencodeDeleted: r.ok, opencodeSessionId: opencodeId }, null, 2) }] };
+        const session = sessionManager.hasSession(sessionId) ? sessionManager.getSession(sessionId) : undefined;
+        const opencodeSessionId = session?.meta.kind === "agent"
+          ? session.meta.opencodeSessionId || session.resolveOpencodeSessionId()
+          : null;
+        const { closed } = sessionManager.closeSession(sessionId);
+        const result = { sessionId, closed, opencodeSessionId };
+        if (!deleteOpencodeSession) {
+          return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
         }
-        return { content: [{ type: "text", text: JSON.stringify({ sessionId, closed: true, opencodeSessionId: opencodeId }, null, 2) }] };
+        let opencodeSessionDeleted = false;
+        let reason: string | undefined = "no opencode session id resolved";
+        if (session && opencodeSessionId) {
+          try {
+            const command = ["session", "delete", assertOpencodeSessionId(opencodeSessionId)];
+            if (session.args[0] === "--server") command.unshift(...session.args.slice(0, 2));
+            const r = runOpencodeSync(command, session.meta.dir);
+            opencodeSessionDeleted = r.ok;
+            reason = r.ok ? undefined : (r.stderr.trim() || r.error || "opencode session delete failed").slice(0, 300);
+          } catch (error) {
+            reason = (error instanceof Error ? error.message : String(error)).slice(0, 300);
+          }
+        }
+        return { content: [{ type: "text", text: JSON.stringify({
+          ...result,
+          opencodeSessionDeleted,
+          ...(opencodeSessionId ? { opencodeDeleted: opencodeSessionDeleted } : {}),
+          reason,
+        }, null, 2) }] };
       }
       case "agent_create":
         return opencodeFailure("Agent creation is unsupported on opencode v2: no agent create command");
       case "opencode_models": {
-        const { provider, refresh, verbose } = args as any;
+        const { provider, refresh, verbose } = args ?? {};
         if (provider !== undefined && (typeof provider !== "string" || !/^[a-zA-Z0-9_-]{1,64}$/.test(provider))) {
           throw new Error("invalid provider");
         }
         if (refresh === true) return opencodeFailure("Model refresh is unsupported on opencode v2: models has no --refresh flag");
         if (verbose === true) return opencodeFailure("Verbose model output is unsupported on opencode v2: models has no --verbose flag");
         const r = runOpencodeSync(["models"], undefined, 60000);
-        const output = r.ok && provider !== undefined
-          ? r.stdout.split(/\r?\n/).filter(line => line.startsWith(`${provider}/`)).join("\n")
-          : r.stdout || r.stderr || r.error || "";
-        return { content: [{ type: "text", text: output.slice(0, 8000) }], isError: r.ok ? undefined : true };
+        if (!r.ok) {
+          return { isError: true, content: [{ type: "text", text: (r.stdout || r.stderr || r.error || "").slice(0, MAX_MODEL_OUTPUT) }] };
+        }
+        const models = r.stdout.split(/\r?\n/).filter(line => line && (provider === undefined || line.startsWith(`${provider}/`)));
+        const output = models.slice(0, MAX_MODELS).join("\n");
+        const text = output.length <= MAX_MODEL_OUTPUT
+          ? output
+          : output.slice(0, Math.max(0, output.lastIndexOf("\n", MAX_MODEL_OUTPUT)));
+        return { content: [{ type: "text", text }] };
       }
       case "opencode_stats": {
         const { days, topTools, topModels, project } = args as any;
@@ -740,7 +780,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           if (typeof hostname !== "string" || !/^[a-zA-Z0-9.-]{1,253}$/.test(hostname)) throw new Error("invalid hostname");
           a.push("--hostname", hostname);
         }
-        const info = sessionManager.spawn(OPENCODE_BIN, a, process.cwd(), OPENCODE_ENV, 5000, "xterm-256color", typeof name === "string" ? name.slice(0, 64) : `opencode-${mode}`, undefined, undefined, undefined, { kind: "pty", promptPreview: `opencode ${a.join(" ")}`.slice(0, 200) });
+        const info = sessionManager.spawn(OPENCODE_BIN, a, process.cwd(), OPENCODE_ENV, 5000, "xterm-256color", typeof name === "string" ? name.slice(0, 64) : `opencode-${mode}`, undefined, undefined, undefined, { kind: "pty", promptPreview: `opencode ${a.join(" ")}`.slice(0, 200) }, undefined, { redactServerPassword: true });
         return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
       }
       case "opencode_status": {
@@ -775,6 +815,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         throw new Error(`Unknown tool: ${name}`);
     }
   } catch (error: any) {
+    if (error instanceof SessionExitedError) {
+      return { isError: true, content: [{ type: "text", text: JSON.stringify({ ok: false, error: error.message, exitCode: error.exitCode }) }] };
+    }
     if (error instanceof OpencodeUsageError) return opencodeFailure(error.message);
     return {
       isError: true,

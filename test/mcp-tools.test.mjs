@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -9,6 +9,7 @@ import * as path from 'node:path';
 import { VERSION } from '../build/version.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const TEST_SERVER_PASSWORD = 'aB_cd-' + '0123456789'.repeat(3) + '0123456';
 
 /** Minimal newline-delimited JSON-RPC client for the server's own stdio transport. */
 function mcpClient(env = {}, cwd = ROOT) {
@@ -258,6 +259,178 @@ fi
   }
 });
 
+async function fakeOpencode(t, script) {
+  const dir = await mkdtemp(path.join(tmpdir(), 'menager-opencode-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const bin = path.join(dir, 'opencode');
+  await writeFile(bin, `#!/bin/sh\n${script}`, { mode: 0o700 });
+  return { bin, dir };
+}
+
+test('managed OpenCode server passwords are absent from PTY output and previews', async (t) => {
+  assert.equal(TEST_SERVER_PASSWORD.length, 43);
+  const { bin, dir } = await fakeOpencode(t, `
+printf 'server pass'
+sleep 0.1
+printf '\\033[32mword\\033[0m %s' '${TEST_SERVER_PASSWORD}'
+sleep 0.2
+printf '\\nserver listening\\n'
+exec sleep 30
+`);
+  const client = mcpClient({ OPENCODE_BIN: bin }, dir);
+  try {
+    await client.init();
+    const server = await client.call('opencode_server_spawn', { mode: 'serve' });
+    assert.equal(server.isError, false, server.text);
+    const { sessionId } = server.json;
+    const ready = await client.call('session_hook', { sessionId, pattern: 'server listening', timeoutMs: 5000 });
+    assert.equal(ready.isError, false, ready.text);
+
+    for (const result of [
+      await client.call('session_read', { sessionId }),
+      await client.call('session_read', { sessionId, stripAnsi: false }),
+      await client.call('session_read', { sessionId, mode: 'screen', includeScrollback: true, settleMs: 200 }),
+      await client.call('agent_info', { sessionId }),
+      ready,
+      server,
+    ]) {
+      assert.equal(result.isError, false);
+      assert.doesNotMatch(result.text, /[A-Za-z0-9_-]{43}/);
+    }
+    assert.match((await client.call('session_read', { sessionId })).text, /server listening/);
+  } finally {
+    await client.close();
+  }
+});
+
+test('session_write reports the exit code for a retained exited PTY', async () => {
+  const client = mcpClient();
+  try {
+    await client.init();
+    const { json: { sessionId } } = await client.call('session_spawn', { command: 'sh', args: ['-c', 'exit 7'] });
+    assert.equal((await client.call('session_wait', { sessionId, timeoutMs: 5000 })).json.exitCode, 7);
+    const write = await client.call('session_write', { sessionId, payload: 'echo ghost' });
+    assert.equal(write.isError, true);
+    assert.deepEqual(write.json, { ok: false, error: 'session exited (code 7)', exitCode: 7 });
+  } finally {
+    await client.close();
+  }
+});
+
+test('agent_close reports unresolved ids and deletes resolved ses_ sessions', async (t) => {
+  const nativeId = 'ses_AbCd12345678';
+  const { bin, dir } = await fakeOpencode(t, `
+case "$1:$2" in
+  run:*)
+    for arg do prompt=$arg; done
+    if [ "$prompt" = tracked ]; then printf '%s\\n' '{"type":"step_start","sessionID":"${nativeId}"}'; fi ;;
+  session:delete)
+    [ "$3" = '${nativeId}' ] && [ -f .native-session ] || exit 1
+    rm .native-session ;;
+  *) exit 2 ;;
+esac
+`);
+  const project = path.join(dir, 'project');
+  await mkdir(project);
+  const nativeSession = path.join(project, '.native-session');
+  await writeFile(nativeSession, nativeId);
+  const client = mcpClient({ OPENCODE_BIN: bin }, dir);
+  try {
+    await client.init();
+    for (const [prompt, deleted, reason] of [
+      ['unresolved', false, 'no opencode session id resolved'],
+      ['tracked', true, undefined],
+      ['tracked', false, 'opencode session delete failed'],
+    ]) {
+      const run = await client.call('agent_spawn', { prompt, cwd: project, format: 'json' });
+      assert.equal(run.isError, false, run.text);
+      const { sessionId } = run.json;
+      assert.equal((await client.call('session_wait', { sessionId, timeoutMs: 5000 })).json.exitCode, 0);
+      if (deleted) {
+        const fork = await client.call('agent_fork', { sessionId, message: 'forked' });
+        assert.equal(fork.isError, false, fork.text);
+        const forkId = fork.json.sessionId;
+        assert.equal((await client.call('session_wait', { sessionId: forkId, timeoutMs: 5000 })).json.exitCode, 0);
+        const closedFork = await client.call('agent_close', { sessionId: forkId, deleteOpencodeSession: true });
+        assert.equal(closedFork.json.opencodeSessionDeleted, false);
+        assert.equal(closedFork.json.reason, 'no opencode session id resolved');
+        assert.equal(await readFile(nativeSession, 'utf8'), nativeId);
+      }
+      const close = await client.call('agent_close', { sessionId, deleteOpencodeSession: true });
+      assert.equal(close.isError, false, close.text);
+      assert.equal(close.json.closed, true);
+      assert.equal(close.json.opencodeSessionId, prompt === 'tracked' ? nativeId : null);
+      assert.equal(close.json.opencodeSessionDeleted, deleted);
+      assert.equal(close.json.reason, reason);
+      if (prompt === 'tracked') {
+        await assert.rejects(readFile(nativeSession), { code: 'ENOENT' });
+      } else {
+        assert.equal(await readFile(nativeSession, 'utf8'), nativeId);
+      }
+    }
+  } finally {
+    await client.close();
+  }
+});
+
+test('agent_list queries OpenCode once per distinct tracked directory', async (t) => {
+  const { bin, dir } = await fakeOpencode(t, `
+case "$1:$2" in
+  run:*) exit 0 ;;
+  session:list)
+    printf '%s\\n' "$PWD" >> "$MENAGER_TEST_QUERIES"
+    case "$(basename "$PWD")" in
+      alpha) printf '%s\\n' '[{"id":"ses_alpha1234"}]' ;;
+      beta) printf '%s\\n' '[{"id":"ses_beta12345"},{"id":"ses_alpha1234"}]' ;;
+      *) exit 2 ;;
+    esac ;;
+  *) exit 2 ;;
+esac
+`);
+  const alpha = path.join(dir, 'alpha');
+  const beta = path.join(dir, 'beta');
+  await Promise.all([mkdir(alpha), mkdir(beta)]);
+  const queries = path.join(dir, 'queries');
+  const client = mcpClient({ OPENCODE_BIN: bin, MENAGER_TEST_QUERIES: queries }, dir);
+  try {
+    await client.init();
+    for (const cwd of [alpha, alpha, beta]) {
+      const run = await client.call('agent_spawn', { prompt: 'hello', cwd });
+      assert.equal(run.isError, false, run.text);
+    }
+    const listing = await client.call('agent_list', { includeOpencode: false });
+    assert.equal(listing.json.tracked.length, 3);
+    await assert.rejects(readFile(queries), { code: 'ENOENT' });
+
+    const merged = await client.call('agent_list', { maxCount: 2 });
+    assert.equal(merged.isError, false, merged.text);
+    assert.equal(merged.json.tracked.length, 3);
+    assert.deepEqual(merged.json.opencode?.map(({ id }) => id).sort(), ['ses_alpha1234', 'ses_beta12345']);
+    assert.deepEqual((await readFile(queries, 'utf8')).trim().split('\n').sort(), [alpha, beta]);
+    assert.equal((await client.call('agent_list', { maxCount: 1 })).json.opencode.length, 1);
+  } finally {
+    await client.close();
+  }
+});
+
+test('opencode_models caps complete rows after provider filtering', async (t) => {
+  const models = ['first', 'second'].flatMap(provider =>
+    Array.from({ length: 75 }, (_, i) => `${provider}/model-${i}`));
+  const { bin, dir } = await fakeOpencode(t, `printf '%s\\n' ${models.join(' ')}\n`);
+  const client = mcpClient({ OPENCODE_BIN: bin }, dir);
+  try {
+    await client.init();
+    for (const provider of [undefined, 'second']) {
+      const result = await client.call('opencode_models', { provider });
+      assert.equal(result.isError, false, result.text);
+      const expected = provider ? models.filter(model => model.startsWith(`${provider}/`)) : models;
+      assert.deepEqual(result.text.trim().split('\n'), expected.slice(0, 50));
+    }
+  } finally {
+    await client.close();
+  }
+});
+
 test('OpenCode v2 wrappers work against the installed CLI', { timeout: 90000 }, async (t) => {
   const bin = process.env.OPENCODE_BIN || 'opencode';
   const version = spawnSync(bin, ['--version'], { encoding: 'utf8', timeout: 10000 });
@@ -265,13 +438,19 @@ test('OpenCode v2 wrappers work against the installed CLI', { timeout: 90000 }, 
   assert.equal(version.status, 0, version.error?.message || version.stderr);
   if (!/\bv?2\./.test(version.stdout)) return t.skip('requires OpenCode v2');
 
-  const listener = createServer();
-  await new Promise((resolve, reject) => {
-    listener.once('error', reject);
-    listener.listen(0, '127.0.0.1', resolve);
-  });
-  const { port } = listener.address();
-  await new Promise(resolve => listener.close(resolve));
+  async function reservePort() {
+    const listener = createServer();
+    await new Promise((resolve, reject) => {
+      listener.once('error', reject);
+      listener.listen(0, '127.0.0.1', resolve);
+    });
+    t.after(() => listener.listening && new Promise(resolve => listener.close(resolve)));
+    return listener;
+  }
+  const mainListener = await reservePort();
+  const probeListener = await reservePort();
+  const { port } = mainListener.address();
+  const { port: probePort } = probeListener.address();
   const attach = `http://127.0.0.1:${port}`;
 
   const dir = await mkdtemp(path.join(tmpdir(), 'menager-opencode-live-'));
@@ -279,7 +458,10 @@ test('OpenCode v2 wrappers work against the installed CLI', { timeout: 90000 }, 
   const launcher = path.join(dir, 'opencode-isolated');
   await writeFile(launcher, `#!/bin/sh
 case "$1" in
-  serve|--server|--version) exec "$MENAGER_TEST_OPENCODE" "$@" ;;
+  serve)
+    if [ "$3" = "$MENAGER_TEST_PROBE_PORT" ]; then unset OPENCODE_SERVER_PASSWORD; fi
+    exec "$MENAGER_TEST_OPENCODE" "$@" ;;
+  --server|--version) exec "$MENAGER_TEST_OPENCODE" "$@" ;;
   run) exec "$MENAGER_TEST_OPENCODE" --standalone "$@" ;;
   *) exec "$MENAGER_TEST_OPENCODE" --server "$MENAGER_TEST_SERVER_URL" "$@" ;;
 esac
@@ -288,13 +470,14 @@ esac
     OPENCODE_BIN: launcher,
     MENAGER_TEST_OPENCODE: bin.includes('/') ? path.resolve(bin) : bin,
     MENAGER_TEST_SERVER_URL: attach,
+    MENAGER_TEST_PROBE_PORT: String(probePort),
     HOME: dir,
     OPENCODE_HOST_HOME: dir,
     XDG_CONFIG_HOME: path.join(dir, 'config'),
     XDG_DATA_HOME: path.join(dir, 'data'),
     XDG_CACHE_HOME: path.join(dir, 'cache'),
     XDG_STATE_HOME: path.join(dir, 'state'),
-    OPENCODE_SERVER_PASSWORD: 'menager-smoke-test',
+    OPENCODE_SERVER_PASSWORD: TEST_SERVER_PASSWORD,
   }, dir);
   try {
     await client.init();
@@ -304,6 +487,16 @@ esac
       return result;
     };
 
+    await new Promise(resolve => probeListener.close(resolve));
+    const probe = (await call('opencode_server_spawn', { mode: 'serve', hostname: '127.0.0.1', port: probePort })).json;
+    await call('session_hook', { sessionId: probe.sessionId, pattern: 'server password', timeoutMs: 10000 });
+    const serverOutput = await call('session_read', { sessionId: probe.sessionId });
+    assert.doesNotMatch(serverOutput.text, /[A-Za-z0-9_-]{43}/);
+    assert.match(serverOutput.text, /\[redacted server password\]/);
+    assert.match(serverOutput.text, /server listening/);
+    await call('session_close', { sessionId: probe.sessionId });
+
+    await new Promise(resolve => mainListener.close(resolve));
     const server = (await call('opencode_server_spawn', { mode: 'serve', hostname: '127.0.0.1', port })).json;
     await call('session_hook', { sessionId: server.sessionId, pattern: 'server listening', timeoutMs: 10000 });
 

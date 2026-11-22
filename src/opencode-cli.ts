@@ -4,9 +4,32 @@ import stripAnsi from "strip-ansi";
 
 const SESSION_ID_RE = /^(?:ses_[A-Za-z0-9]{8,64}|[A-Fa-f0-9]{8}(?:-[A-Fa-f0-9]{4}){3}-[A-Fa-f0-9]{12})$/;
 
+function isOpencodeSessionId(value: unknown): value is string {
+  return typeof value === "string" && SESSION_ID_RE.test(value);
+}
+
 export function assertOpencodeSessionId(value: unknown): string {
-  if (typeof value !== "string" || !SESSION_ID_RE.test(value)) throw new Error("invalid sessionId");
+  if (!isOpencodeSessionId(value)) throw new Error("invalid sessionId");
   return value;
+}
+
+export function resolveOpencodeSessionId(lines: string[]): string | null {
+  let textId: string | null = null;
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (line.startsWith("{")) {
+      try {
+        const event = JSON.parse(line);
+        const id = event.sessionID ?? event.sessionId;
+        if (isOpencodeSessionId(id)) return id;
+      } catch {
+        continue;
+      }
+    }
+    const id = line.replace(/^(?:opencode\s+)?session(?:\s*id)?(?:\s*[:=]\s*|\s+)/i, "");
+    if (textId === null && isOpencodeSessionId(id)) textId = id;
+  }
+  return textId;
 }
 
 export function opencodeUsageError(stdout: string, stderr: string): string | undefined {

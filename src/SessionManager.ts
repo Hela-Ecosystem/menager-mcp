@@ -7,6 +7,7 @@ import { spawnSync } from 'node:child_process';
 // @ts-ignore
 import killTree from 'tree-kill';
 import { ScreenBuffer, ScreenSnapshot, screenEnabled } from './ScreenBuffer.js';
+import { resolveOpencodeSessionId } from './opencode-cli.js';
 import {
   TmuxState,
   buildTmuxArgs,
@@ -179,7 +180,14 @@ interface SessionHook {
   seen?: string;
 }
 
-const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+const SERVER_PASSWORD_LINE_RE = /\bserver\s+password\b/i;
+const SERVER_OUTPUT_LINE_LIMIT = 64 * 1024;
+
+export class SessionExitedError extends Error {
+  constructor(public readonly exitCode: number | null) {
+    super(`session exited (code ${exitCode})`);
+  }
+}
 
 /** Text kept per hook for cross-chunk patterns; bounded so a chatty session cannot grow it. */
 const HOOK_SEEN_LIMIT = 64 * 1024;
@@ -231,6 +239,8 @@ export class Session {
   private readonly cwd: string;
   private readonly childEnv: Record<string, string>;
   private readonly terminalType: string;
+  private readonly redactServerPassword: boolean;
+  private pendingServerLine: string | null = '';
   private cols: number;
   private rows: number;
   private readonly onCleanup?: () => void;
@@ -248,7 +258,7 @@ export class Session {
     public ttlMs?: number,
     onCleanup?: () => void,
     transportOpts: { transport?: SessionTransport; host?: string; tmux?: TmuxState } = {},
-    extra: { sessionId?: string; persistOnClose?: boolean } = {}
+    extra: SpawnOptions = {}
   ) {
     if (!fs.existsSync(cwd)) {
       throw new Error(`CWD does not exist: ${cwd}`);
@@ -257,6 +267,7 @@ export class Session {
     this.host = transportOpts.host;
     this.tmux = transportOpts.tmux;
     this.persistOnClose = extra.persistOnClose === true;
+    this.redactServerPassword = extra.redactServerPassword === true;
     this.id = extra.sessionId ?? crypto.randomBytes(4).toString('hex');
     this.maxBufferLines = maxBufferLines;
     this.createdAt = new Date().toISOString();
@@ -284,12 +295,19 @@ export class Session {
       env: this.childEnv,
     });
 
-    proc.onData((data) => this.handleData(data));
+    proc.onData(data => {
+      if (this.ptyProcess !== proc) return;
+      if (this.redactServerPassword) this.handleServerData(data);
+      else this.handleData(data);
+    });
     proc.onExit((event) => {
       // A stale handler from a previous transport must not bury a live reattach.
       if (this.ptyProcess !== proc) return;
       this.status = 'exited';
       this.exitCode = event.exitCode;
+      if (this.redactServerPassword && this.pendingServerLine !== '') {
+        this.handleData(this.finishServerLine());
+      }
       if (this.transport === 'ssh') {
         this.exitKind = event.exitCode === SSH_TRANSPORT_EXIT_CODE ? 'transport' : 'remote';
       }
@@ -306,6 +324,31 @@ export class Session {
       }
     });
     return proc;
+  }
+
+  private finishServerLine(): string {
+    const line = this.pendingServerLine;
+    this.pendingServerLine = '';
+    if (line === null) return '[oversized server output line omitted]';
+    if (SERVER_PASSWORD_LINE_RE.test(stripAnsi(line))) {
+      return '[redacted server password]' + (line.endsWith('\r') ? '\r' : '');
+    }
+    return line;
+  }
+
+  private handleServerData(data: string) {
+    // Keep partial lines out of every output view, including when the label spans PTY chunks.
+    const lines = data.split('\n');
+    const output: string[] = [];
+    for (const [index, part] of lines.entries()) {
+      if (this.pendingServerLine !== null) {
+        this.pendingServerLine = this.pendingServerLine.length + part.length <= SERVER_OUTPUT_LINE_LIMIT
+          ? this.pendingServerLine + part
+          : null;
+      }
+      if (index < lines.length - 1) output.push(this.finishServerLine());
+    }
+    if (output.length) this.handleData(output.join('\n') + '\n');
   }
 
   private handleData(data: string) {
@@ -338,9 +381,11 @@ export class Session {
         clearTimeout(hook.timeout);
         this.hooks.delete(hook);
         if (hook.autoResponse) {
-          this.write(hook.autoResponse, true).catch(() => {});
+          const matched = hook.seen;
+          this.write(hook.autoResponse, true).then(() => hook.resolve(matched), hook.reject);
+        } else {
+          hook.resolve(hook.seen);
         }
-        hook.resolve(hook.seen);
       }
     }
   }
@@ -354,6 +399,7 @@ export class Session {
   }
 
   public async write(payload: string, pressEnter: boolean = false, pressKey?: string): Promise<number> {
+    this.ensureWritable();
     let finalPayload = payload;
     if (pressKey) {
       const keys: Record<string, string> = {
@@ -376,9 +422,14 @@ export class Session {
       this.ptyProcess.write(finalPayload.slice(i, i + chunkSize));
       if (i + chunkSize < finalPayload.length) {
         await new Promise(resolve => setTimeout(resolve, 5));
+        this.ensureWritable();
       }
     }
     return finalPayload.length;
+  }
+
+  private ensureWritable(): void {
+    if (this.status === 'exited') throw new SessionExitedError(this.exitCode);
   }
 
   public getLines(tailLines: number = 100, stripAnsi: boolean = true, clearBuffer: boolean = false, offsetLines?: number, grepPattern?: string): string {
@@ -464,11 +515,13 @@ export class Session {
       // With a trigger, the marker must come from what the payload produces — not from
       // text already on screen, which may hold an earlier run's marker.
       if (!triggerPayload && pattern.test(existingData)) {
+        const match = existingData.match(pattern)?.[0] ?? "Matched in buffer";
         if (autoResponse) {
-          this.write(autoResponse, true);
+          this.write(autoResponse, true).then(() => resolve(match), reject);
+        } else {
+          resolve(match);
         }
-        const match = existingData.match(pattern);
-        return resolve(match ? match[0] : "Matched in buffer");
+        return;
       }
 
       let hookObj: SessionHook | undefined;
@@ -493,7 +546,12 @@ export class Session {
       this.hooks.add(hookObj);
 
       if (triggerPayload) {
-        this.write(triggerPayload, true);
+        const hook = hookObj;
+        this.write(triggerPayload, true).catch(error => {
+          clearTimeout(hook.timeout);
+          this.hooks.delete(hook);
+          reject(error);
+        });
       }
     });
   }
@@ -589,6 +647,7 @@ export class Session {
       this.reapTimer = undefined;
     }
     this.cleanupHooks(new Error('Session disposed'));
+    this.pendingServerLine = '';
     this.screen?.dispose();
     this.screen = undefined;
   }
@@ -623,11 +682,7 @@ export class Session {
   }
 
   public resolveOpencodeSessionId(): string | null {
-    const text = this.cleanLines.join('\n');
-    const near = text.match(/session[^0-9a-f]{0,24}([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
-    if (near) return near[1];
-    const any = text.match(UUID_RE);
-    return any ? any[0] : null;
+    return resolveOpencodeSessionId(this.cleanLines);
   }
 
   public getInfo(): SessionInfo {
@@ -658,6 +713,8 @@ export interface SpawnOptions {
   sessionId?: string;
   /** PTY-04: leave the remote tmux window running when the session is closed. */
   persistOnClose?: boolean;
+  /** Redact the authentication banner from a managed OpenCode server. */
+  redactServerPassword?: boolean;
 }
 
 export interface RemoteOptions {
@@ -759,7 +816,7 @@ export class SessionManager {
     if (meta?.step_id && !childEnv.HELA_STEP_ID) childEnv.HELA_STEP_ID = String(meta.step_id);
     const session = new Session(execCommand, execArgs, cwd, childEnv, clampedBuffer, terminalType, name, cols, rows, ttl, () => {
       this.sessions.delete(session.id);
-    }, { transport, host, tmux }, { sessionId, persistOnClose: opts.persistOnClose });
+    }, { transport, host, tmux }, { ...opts, sessionId });
     if (meta) session.meta = { ...session.meta, ...meta };
     this.sessions.set(session.id, session);
     return session.getInfo();
