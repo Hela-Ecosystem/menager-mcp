@@ -134,7 +134,7 @@ Reads buffered output from the target session: the line buffer, or the rendered 
 - **`sessionId`** *(string)*: Target session ID. **Required.**
 - **`mode`** *(string)*: `"lines"` (default) or `"screen"`. An unknown value is a typed `{"error": …}`.
 - **`tailLines`** *(number)*: Number of trailing lines to retrieve (default 100).
-- **`stripAnsi`** *(boolean)*: Return sanitized text without ANSI codes (default true). *(lines mode)*
+- **`stripAnsi`** *(boolean)*: Return sanitized text without ANSI codes, replaying carriage-return overwrites so a line reflects its final rendered state rather than every redraw fragment (default true). *(lines mode)*
 - **`clearBuffer`** *(boolean)*: Flush internal buffers after read (default false). *(lines mode)*
 - **`offsetLines`** *(number)*: Read lines starting from this absolute index offset (replaces tailLines). *(lines mode)*
 - **`grepPattern`** *(string)*: Pre-filter buffer lines via Regex string matching. *(lines mode)*

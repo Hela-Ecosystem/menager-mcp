@@ -231,7 +231,7 @@ const TOOLS: Tool[] = [
         sessionId: { type: "string" },
         mode: { type: "string", enum: ["lines", "screen"], description: "'lines' (default) returns the ring buffer as text. 'screen' returns the @xterm/headless rendered frame as JSON — what a human would see — which is what TUIs, progress bars and full-screen apps actually need." },
         tailLines: { type: "number" },
-        stripAnsi: { type: "boolean" },
+        stripAnsi: { type: "boolean", description: "lines mode: strip ANSI escape codes and replay carriage-return overwrites so each line shows its final rendered text (default true)." },
         clearBuffer: { type: "boolean" },
         offsetLines: { type: "number", description: "Read lines starting from this index" },
         grepPattern: { type: "string", description: "Filter read lines by regex pattern" },

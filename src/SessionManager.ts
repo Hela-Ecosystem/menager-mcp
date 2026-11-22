@@ -184,6 +184,29 @@ interface SessionHook {
 const SERVER_PASSWORD_LINE_RE = /\bserver\s+password\b/i;
 const SERVER_OUTPUT_LINE_LIMIT = 64 * 1024;
 
+/**
+ * Replays carriage-return semantics on one captured line. A terminal CR returns the
+ * cursor to column 0, so each later frame overwrites what preceded it while a longer
+ * tail from the earlier frame stays visible (`abc\rXY` -> `XYc`). Lines without a CR
+ * are returned untouched. Callers pass ANSI-free text so escape codes don't count as
+ * columns.
+ */
+export function applyCarriageReturns(line: string): string {
+  if (!line.includes('\r')) return line;
+  const frames = line.split('\r');
+  let rendered = frames[0];
+  for (let i = 1; i < frames.length; i++) {
+    const frame = frames[i];
+    rendered = frame + rendered.slice(frame.length);
+  }
+  return rendered;
+}
+
+/** The `stripAnsi` view of a raw line: readable text, with redraws resolved. */
+function cleanLine(raw: string): string {
+  return applyCarriageReturns(stripAnsi(raw));
+}
+
 export class SessionExitedError extends Error {
   constructor(public readonly exitCode: number | null) {
     super(`session exited (code ${exitCode})`);
@@ -360,13 +383,13 @@ export class Session {
 
     const chunks = data.split('\r\n').join('\n').split('\n');
 
-    // Update the last raw line and re-strip it entirely to fix ANSI fragmentation
+    // Update the last raw line and re-render it entirely to fix ANSI and CR fragmentation
     this.rawLines[this.rawLines.length - 1] += chunks[0];
-    this.cleanLines[this.cleanLines.length - 1] = stripAnsi(this.rawLines[this.rawLines.length - 1]);
+    this.cleanLines[this.cleanLines.length - 1] = cleanLine(this.rawLines[this.rawLines.length - 1]);
 
     for (let i = 1; i < chunks.length; i++) {
       this.rawLines.push(chunks[i]);
-      this.cleanLines.push(stripAnsi(chunks[i]));
+      this.cleanLines.push(cleanLine(chunks[i]));
     }
 
     if (chunks.length > 1 && this.opencodeJsonOutput && !this.meta.opencodeSessionId) {

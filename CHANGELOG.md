@@ -1,5 +1,8 @@
 ## [Unreleased]
 
+### Fixed
+- `session_read` `lines` mode replays carriage-return overwrites when `stripAnsi` is set, so prompt redraws no longer surface as interleaved echo fragments (`<cho MARKER-START; …`) ahead of the real output. `stripAnsi: false` still returns the untouched raw stream. (`menager-mcp#17`)
+
 ## [3.2.1] - 2026-11-22
 
 ### Fixed
