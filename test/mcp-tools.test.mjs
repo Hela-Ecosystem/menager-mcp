@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:net';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import * as path from 'node:path';
 import { VERSION } from '../build/version.js';
@@ -8,9 +11,9 @@ import { VERSION } from '../build/version.js';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 /** Minimal newline-delimited JSON-RPC client for the server's own stdio transport. */
-function mcpClient(env = {}) {
+function mcpClient(env = {}, cwd = ROOT) {
   const child = spawn(process.execPath, [path.join(ROOT, 'build', 'index.js')], {
-    cwd: ROOT,
+    cwd,
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, ...env },
   });
@@ -200,6 +203,159 @@ test('PTY-04: session_spawn with a known sessionId re-attaches instead of spawni
     assert.equal(info.json.tmux, undefined, 'local sessions carry no tmux state');
 
     await client.call('session_close', { sessionId: 'toolreattach' });
+  } finally {
+    await client.close();
+  }
+});
+
+test('OpenCode v2 unsupported tools fail explicitly without invoking the CLI', async () => {
+  const client = mcpClient({ OPENCODE_BIN: '/nonexistent/opencode' });
+  try {
+    await client.init();
+    for (const [tool, args, reason] of [
+      ['opencode_db', {}, /no db command/i],
+      ['opencode_db', { query: 'SELECT 1' }, /no db command/i],
+      ['agent_create', { description: 'test agent' }, /no agent create command/i],
+      ['agent_spawn', { prompt: 'hello', share: true }, /--share/],
+      ['opencode_models', { refresh: true }, /--refresh/],
+      ['opencode_models', { verbose: true }, /--verbose/],
+    ]) {
+      const result = await client.call(tool, args);
+      assert.equal(result.isError, true, result.text);
+      assert.equal(result.json.ok, false, result.text);
+      assert.match(result.json.error, /unsupported on opencode v2/i);
+      assert.match(result.json.error, reason);
+    }
+  } finally {
+    await client.close();
+  }
+});
+
+test('OpenCode help and unknown flags become MCP errors with a single diagnostic', async (t) => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'menager-opencode-help-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const bin = path.join(dir, 'opencode');
+  await writeFile(bin, `#!/bin/sh
+printf 'DESCRIPTION\\n  Test CLI\\n\\nUSAGE\\n  opencode %s [flags]\\n\\nGLOBAL FLAGS\\n  --help\\n' "$1"
+if [ "$1" = models ]; then
+  printf 'ERROR\\n  Unrecognized flag: --retired\\n' >&2
+  exit 1
+fi
+`, { mode: 0o700 });
+  const client = mcpClient({ OPENCODE_BIN: bin });
+  try {
+    await client.init();
+    for (const [tool, error] of [
+      ['opencode_models', 'Unrecognized flag: --retired'],
+      ['opencode_stats', 'Usage: opencode stats [flags]'],
+    ]) {
+      const result = await client.call(tool, {});
+      assert.equal(result.isError, true, result.text);
+      assert.deepEqual(result.json, { ok: false, error });
+    }
+  } finally {
+    await client.close();
+  }
+});
+
+test('OpenCode v2 wrappers work against the installed CLI', { timeout: 90000 }, async (t) => {
+  const bin = process.env.OPENCODE_BIN || 'opencode';
+  const version = spawnSync(bin, ['--version'], { encoding: 'utf8', timeout: 10000 });
+  if (version.error?.code === 'ENOENT') return t.skip('opencode is absent');
+  assert.equal(version.status, 0, version.error?.message || version.stderr);
+  if (!/\bv?2\./.test(version.stdout)) return t.skip('requires OpenCode v2');
+
+  const listener = createServer();
+  await new Promise((resolve, reject) => {
+    listener.once('error', reject);
+    listener.listen(0, '127.0.0.1', resolve);
+  });
+  const { port } = listener.address();
+  await new Promise(resolve => listener.close(resolve));
+  const attach = `http://127.0.0.1:${port}`;
+
+  const dir = await mkdtemp(path.join(tmpdir(), 'menager-opencode-live-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const launcher = path.join(dir, 'opencode-isolated');
+  await writeFile(launcher, `#!/bin/sh
+case "$1" in
+  serve|--server|--version) exec "$MENAGER_TEST_OPENCODE" "$@" ;;
+  run) exec "$MENAGER_TEST_OPENCODE" --standalone "$@" ;;
+  *) exec "$MENAGER_TEST_OPENCODE" --server "$MENAGER_TEST_SERVER_URL" "$@" ;;
+esac
+`, { mode: 0o700 });
+  const client = mcpClient({
+    OPENCODE_BIN: launcher,
+    MENAGER_TEST_OPENCODE: bin.includes('/') ? path.resolve(bin) : bin,
+    MENAGER_TEST_SERVER_URL: attach,
+    HOME: dir,
+    OPENCODE_HOST_HOME: dir,
+    XDG_CONFIG_HOME: path.join(dir, 'config'),
+    XDG_DATA_HOME: path.join(dir, 'data'),
+    XDG_CACHE_HOME: path.join(dir, 'cache'),
+    XDG_STATE_HOME: path.join(dir, 'state'),
+    OPENCODE_SERVER_PASSWORD: 'menager-smoke-test',
+  }, dir);
+  try {
+    await client.init();
+    const call = async (tool, args = {}) => {
+      const result = await client.call(tool, args);
+      assert.equal(result.isError, false, `${tool}: ${result.text}`);
+      return result;
+    };
+
+    const server = (await call('opencode_server_spawn', { mode: 'serve', hostname: '127.0.0.1', port })).json;
+    await call('session_hook', { sessionId: server.sessionId, pattern: 'server listening', timeoutMs: 10000 });
+
+    const status = (await call('opencode_status')).json;
+    assert.equal(status.available, true);
+    assert.equal(status.version, version.stdout.trim());
+    assert.ok(JSON.parse(status.agentsOutput).some(agent => agent.id === 'build'));
+
+    const allModels = (await call('opencode_models')).text.trim().split('\n');
+    const provider = allModels[0].split('/')[0];
+    const filtered = (await call('opencode_models', { provider })).text.trim().split('\n');
+    assert.ok(filtered[0].startsWith(`${provider}/`));
+    assert.ok(filtered.every(model => model.startsWith(`${provider}/`)));
+    assert.equal((await call('opencode_models', { provider: 'menager_missing_provider' })).text, '');
+
+    // An unknown provider exercises session creation and argv parsing with no model request.
+    const model = 'menager_missing_provider/missing';
+    const run = (await call('agent_spawn', {
+      prompt: '--help',
+      model,
+      attach,
+      format: 'json',
+    })).json;
+    const finished = await call('session_wait', { sessionId: run.sessionId, timeoutMs: 12000 });
+    assert.ok(Number.isInteger(finished.json.exitCode), finished.text);
+    const output = await call('session_read', { sessionId: run.sessionId });
+    assert.match(output.text, /Model unavailable/);
+
+    const listed = (await call('agent_list', { maxCount: 1 })).json.opencode;
+    assert.equal(listed.length, 1);
+    const { id: sessionId } = listed[0];
+    assert.match(sessionId, /^ses_[A-Za-z0-9]+$/);
+    const exported = await call('opencode_export', { sessionId });
+    assert.equal(exported.json.info.id, sessionId);
+    assert.equal(exported.json.messages[0].text, '--help');
+    const sanitized = await call('opencode_export', { sessionId, sanitize: true });
+    assert.match(sanitized.json.messages[0].text, /redacted/);
+
+    const file = path.join(dir, 'session.json');
+    await writeFile(file, exported.text);
+    assert.equal((await call('opencode_session_delete', { sessionId })).json.deleted, true);
+    assert.deepEqual((await call('agent_list')).json.opencode, []);
+    assert.equal((await call('opencode_import', { file })).json.ok, true);
+    assert.equal((await call('agent_list')).json.opencode[0].id, sessionId);
+
+    await call('opencode_stats', { days: 0, topModels: 1, topTools: 1 });
+    await call('opencode_mcp_list');
+    await call('opencode_auth_list');
+
+    const standalone = (await call('agent_spawn', { prompt: 'Smoke test', title: '--help', model, format: 'json' })).json;
+    await call('session_wait', { sessionId: standalone.sessionId, timeoutMs: 12000 });
+    assert.match((await call('session_read', { sessionId: standalone.sessionId })).text, /Model unavailable/);
   } finally {
     await client.close();
   }

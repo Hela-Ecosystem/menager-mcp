@@ -201,26 +201,28 @@ Lists all active and completed interactive PTY sessions managed by the server. N
 
 ### OpenCode Native Orchestration
 
-Native `opencode` CLI integration (see [CLI docs](https://opencode.ai/docs/cli/)) for agent routing and multi-session orchestration. Each spawned agent lives in its own PTY session with `meta.kind: "agent"` tracking (`agent`, `model`, `dir`, resolved opencode session id).
+The wrappers target OpenCode v2. Each spawned agent runs in its own PTY session with `meta.kind: "agent"` tracking (`agent`, `model`, `dir`, resolved OpenCode session ID). [CLI docs](https://opencode.ai/docs/cli/)
 
 | Tool | Maps to | Purpose |
 | :--- | :--- | :--- |
-| `agent_spawn` | `opencode run "<prompt>" [--agent --model --title --share --attach]` | Spawn an agent run in a managed PTY; returns `sessionId` for routing. |
+| `agent_spawn` | `opencode [--server <url>] run "<prompt>"` | Spawn an agent in a managed PTY. Pass the server URL as `attach`. |
 | `agent_send` | PTY write, or `opencode run --session <id> "<msg>"` (falls back to `--continue`) | Follow-up message to a live or exited agent. |
 | `agent_fork` | `opencode run --session <id> --fork "<msg>"` | Branch a session into a new tracked session. |
 | `agent_list` | menager tracking + `opencode session list --format json` | List routed agents merged with native sessions. |
 | `agent_info` | session metadata + resolved opencode id + output preview | Inspect one agent. |
 | `agent_close` | close PTY, optionally `opencode session delete <id>` | Teardown with `deleteOpencodeSession`. |
-| `opencode_status` | `opencode --version` + `opencode agent list` | CLI health, defined agents, tracked counts. |
-| `agent_create` | `opencode agent create --path --description --mode --permissions --model` | Define new agents for later `agent_spawn`. |
-| `opencode_models` | `opencode models [provider] [--refresh] [--verbose]` | Model discovery for `agent_spawn --model`. |
+| `opencode_status` | `opencode --version` + `opencode debug agents` | CLI availability, version, agent IDs, names, and modes, and tracked counts. |
+| `agent_create` | Unsupported on OpenCode v2 | Returns `ok: false` because the CLI has no agent creation command. |
+| `opencode_models` | `opencode models` | Lists models and filters by `provider` when supplied. |
 | `opencode_stats` | `opencode stats [--days N] [--tools] [--models] [--project ID] [--limit N]` | Usage/cost observability. |
-| `opencode_export` / `opencode_import` | `opencode export [id]` / `import <file>` | Session portability. |
+| `opencode_export` / `opencode_import` | `opencode session export <id>` / `opencode session import <file>` | Export or import session JSON. |
 | `opencode_session_delete` | `opencode session delete <id>` | Standalone native delete. |
 | `opencode_mcp_list` | `opencode mcp list` | MCP connection health. |
 | `opencode_auth_list` | `opencode auth list` | Provider auth names (read-only, no secrets). |
-| `opencode_db` | `opencode db [query] [--format]` | Direct db inspection. |
-| `opencode_server_spawn` | `opencode serve\|web\|acp [--port --hostname]` in a managed PTY | Warm server for `agent_spawn --attach`. |
+| `opencode_db` | Unsupported on OpenCode v2 | Returns `ok: false` because the CLI has no database inspection command. |
+| `opencode_server_spawn` | `opencode serve [--port --hostname]` in a managed PTY | Starts a server whose URL can be passed to `agent_spawn` as `attach`. |
+
+The legacy `share`, `refresh`, and `verbose` inputs return `ok: false` when enabled because OpenCode v2 removed their CLI flags.
 
 Deliberately excluded: `tui` (interactive), `auth login/logout` (interactive secrets), `upgrade`/`uninstall` (host-destructive), `github`/`plugin`/`pr` (repo admin — run directly).
 

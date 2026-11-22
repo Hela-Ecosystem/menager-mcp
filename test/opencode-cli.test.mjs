@@ -1,6 +1,32 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildStatsArgs, opencodeHostEnv } from '../build/opencode-cli.js';
+import { assertOpencodeSessionId, buildStatsArgs, opencodeHostEnv, opencodeUsageError } from '../build/opencode-cli.js';
+
+test('session IDs accept OpenCode v2 IDs and UUIDs', () => {
+  for (const id of [
+    'ses_dff6541ebffeZ3KjHphGDsVBvC',
+    'ses_AbCd1234',
+    `ses_${'A'.repeat(64)}`,
+    '550e8400-e29b-41d4-a716-446655440000',
+  ]) {
+    assert.equal(assertOpencodeSessionId(id), id);
+  }
+  for (const id of [undefined, 123, 'deadbeef', 'ses_AbCd123', 'ses_abcd-1234',
+    `ses_${'A'.repeat(65)}`, 'ses_ABCD1234\n', '--help']) {
+    assert.throws(() => assertOpencodeSessionId(id), /invalid sessionId/);
+  }
+});
+
+test('CLI usage failures report one diagnostic line, even when help is on stdout', () => {
+  const help = 'DESCRIPTION\n  List all available models\n\nUSAGE\n  opencode models [flags]\n\nGLOBAL FLAGS\n  --help, -h  Show help information\n';
+  assert.equal(opencodeUsageError(help, ''), 'Usage: opencode models [flags]');
+  assert.equal(
+    opencodeUsageError(help, '\x1b[31mERROR\x1b[0m\n  \x1b[31mUnrecognized flag: --refresh in command opencode models\x1b[0m\n'),
+    'Unrecognized flag: --refresh in command opencode models',
+  );
+  assert.equal(opencodeUsageError(help, 'ERROR\n  Unexpected positional argument: "foo"'), 'Unexpected positional argument: "foo"');
+  assert.equal(opencodeUsageError('{"title":"Unrecognized flag: --refresh"}', ''), undefined);
+});
 
 test('stats uses boolean section flags and a single row limit', () => {
   assert.deepEqual(buildStatsArgs({ days: 7, topTools: 5 }), [

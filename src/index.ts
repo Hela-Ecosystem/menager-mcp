@@ -8,7 +8,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { spawnSync } from "node:child_process";
 import { SessionManager } from "./SessionManager.js";
-import { buildStatsArgs, opencodeHostEnv } from "./opencode-cli.js";
+import { assertOpencodeSessionId, buildStatsArgs, opencodeHostEnv, opencodeUsageError } from "./opencode-cli.js";
 import { VERSION } from "./version.js";
 
 const sessionManager = new SessionManager();
@@ -46,26 +46,28 @@ function assertModel(v: unknown): string | undefined {
   return v;
 }
 
-function buildRunArgs(o: { message: string; session?: string; fork?: boolean; share?: boolean; model?: string; agent?: string; format?: string; title?: string; attach?: string }): string[] {
-  const a = ["run", o.message];
+function assertServerUrl(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !/^https?:\/\//i.test(value) || !URL.canParse(value)) {
+    throw new Error("attach must be an HTTP or HTTPS server URL");
+  }
+  return value;
+}
+
+function buildRunArgs(o: { message: string; session?: string; fork?: boolean; model?: string; agent?: string; format?: string; title?: string; attach?: string }): string[] {
+  const a = ["run"];
+  if (o.attach) a.unshift("--server", o.attach);
   if (o.session) { a.push("--session", o.session); }
   if (o.fork) {
     if (!o.session) throw new Error("fork requires session");
     a.push("--fork");
   }
-  if (o.share) a.push("--share");
-  if (o.model) a.push("--model", o.model);
+  if (o.model) a.push(`--model=${o.model}`);
   if (o.agent) a.push("--agent", o.agent);
   if (o.format === "json") a.push("--format", "json");
-  if (o.title) a.push("--title", o.title.slice(0, 120));
-  if (o.attach) a.push("--attach", o.attach);
+  if (o.title) a.push(`--title=${o.title.slice(0, 120)}`);
+  a.push("--", o.message);
   return a;
-}
-
-function assertMode(v: unknown): string | undefined {
-  if (v === undefined) return undefined;
-  if (v !== "all" && v !== "primary" && v !== "subagent") throw new Error("mode must be all|primary|subagent");
-  return v as string;
 }
 
 function assertSafePath(v: unknown, what: string): string {
@@ -81,13 +83,19 @@ function assertPort(v: unknown): number | undefined {
   return n;
 }
 
+class OpencodeUsageError extends Error {}
+
+function opencodeFailure(error: string) {
+  return { isError: true, content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error }) }] };
+}
+
 function runOpencodeSync(args: string[], cwd?: string, timeoutMs = 15000): { ok: boolean; stdout: string; stderr: string; error?: string } {
-  try {
-    const r = spawnSync(OPENCODE_BIN, args, { cwd: cwd || process.cwd(), timeout: timeoutMs, encoding: "utf-8", shell: false, maxBuffer: 2 * 1024 * 1024, env: OPENCODE_ENV });
-    return { ok: r.status === 0, stdout: String(r.stdout || ""), stderr: String(r.stderr || ""), error: r.error ? String(r.error) : undefined };
-  } catch (e: any) {
-    return { ok: false, stdout: "", stderr: "", error: e?.message || String(e) };
-  }
+  const result = spawnSync(OPENCODE_BIN, args, { cwd: cwd || process.cwd(), timeout: timeoutMs, encoding: "utf-8", shell: false, maxBuffer: 2 * 1024 * 1024, env: OPENCODE_ENV });
+  const stdout = result.stdout ?? "";
+  const stderr = result.stderr ?? "";
+  const usageError = opencodeUsageError(stdout, stderr);
+  if (usageError) throw new OpencodeUsageError(usageError);
+  return { ok: result.status === 0, stdout, stderr, error: result.error?.message };
 }
 
 const server = new Server(
@@ -267,8 +275,8 @@ const TOOLS: Tool[] = [
         cwd: { type: "string", description: "Working directory for the agent run" },
         title: { type: "string", description: "Session title" },
         format: { type: "string", enum: ["default", "json"], description: "opencode output format" },
-        share: { type: "boolean", description: "Share the opencode session" },
-        attach: { type: "string", description: "Attach to a running opencode server URL" },
+        share: { type: "boolean", description: "Legacy option. Sharing is unsupported on opencode v2." },
+        attach: { type: "string", description: "Connect to a running opencode server URL (--server)" },
         name: { type: "string", description: "Logical name for routing" },
         cols: { type: "number" },
         rows: { type: "number" },
@@ -350,7 +358,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "agent_create",
-    description: "Create a new opencode agent file (opencode agent create --path --description --mode --permissions --model). Non-interactive when all of path/description/mode/permissions are given.",
+    description: "Legacy tool. Agent creation is unsupported on opencode v2.",
     inputSchema: {
       type: "object",
       properties: {
@@ -365,13 +373,13 @@ const TOOLS: Tool[] = [
   },
   {
     name: "opencode_models",
-    description: "List available models (opencode models [provider] [--refresh] [--verbose]).",
+    description: "List available models, optionally filtered by provider.",
     inputSchema: {
       type: "object",
       properties: {
         provider: { type: "string" },
-        refresh: { type: "boolean" },
-        verbose: { type: "boolean" }
+        refresh: { type: "boolean", description: "Legacy option. Unsupported on opencode v2." },
+        verbose: { type: "boolean", description: "Legacy option. Unsupported on opencode v2." }
       },
       required: []
     }
@@ -392,7 +400,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "opencode_export",
-    description: "Export opencode session data as JSON (opencode export [sessionID]).",
+    description: "Export opencode session data as JSON (opencode session export <sessionID>).",
     inputSchema: {
       type: "object",
       properties: {
@@ -404,7 +412,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "opencode_import",
-    description: "Import opencode session data from a JSON file (opencode import <file>).",
+    description: "Import opencode session data from a JSON file (opencode session import <file>).",
     inputSchema: {
       type: "object",
       properties: {
@@ -444,7 +452,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "opencode_db",
-    description: "Restricted to OpenCode session database inspection; use hela-genome execute_sql/query_data for the HeLa memory graph. Query the opencode database (opencode db [query]). Read with no query prints the db path context.",
+    description: "Legacy tool. Direct session database inspection is unsupported on opencode v2.",
     inputSchema: {
       type: "object",
       properties: {
@@ -456,7 +464,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "opencode_server_spawn",
-    description: "Spawn a long-running opencode server (serve|web|acp) in a managed PTY so agent_spawn --attach has a warm target and avoids MCP cold boot.",
+    description: "Spawn a long-running opencode server in a managed PTY. Use its URL as the attach input to agent_spawn.",
     inputSchema: {
       type: "object",
       properties: {
@@ -590,11 +598,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       case "agent_spawn": {
         const { prompt: rawPrompt, agent: rawAgent, model: rawModel, cwd = process.cwd(), title, format, share, attach, name, cols, rows, run_id, step_id } = args as any;
+        if (share === true) return opencodeFailure("Sharing is unsupported on opencode v2: run has no --share flag");
         const prompt = assertPrompt(rawPrompt);
         const agent = assertAgent(rawAgent);
         const model = assertModel(rawModel);
         const fmt = format === "json" ? "json" : undefined;
-        const runArgs = buildRunArgs({ message: prompt, model, agent, format: fmt, title: typeof title === "string" ? title : undefined, share: share === true, attach: typeof attach === "string" ? attach : undefined });
+        const runArgs = buildRunArgs({ message: prompt, model, agent, format: fmt, title: typeof title === "string" ? title : undefined, attach: assertServerUrl(attach) });
         const info = sessionManager.spawn(OPENCODE_BIN, runArgs, cwd, OPENCODE_ENV, 5000, "xterm-256color", name, cols, rows, undefined, {
           kind: "agent", agent, model, dir: cwd,
           title: typeof title === "string" ? title.slice(0, 120) : undefined,
@@ -667,34 +676,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
         return { content: [{ type: "text", text: JSON.stringify({ sessionId, closed: true, opencodeSessionId: opencodeId }, null, 2) }] };
       }
-      case "agent_create": {
-        const { path, description, mode, permissions, model } = args as any;
-        if (typeof description !== "string" || !description.trim() || description.length > 2000) throw new Error("description must be 1-2000 chars");
-        const a = ["agent", "create"];
-        if (path !== undefined) a.push("--path", assertSafePath(path, "path"));
-        a.push("--description", (description as string).slice(0, 2000));
-        const m = assertMode(mode);
-        if (m) a.push("--mode", m);
-        if (permissions !== undefined) {
-          if (typeof permissions !== "string" || !/^[a-z,]+$/.test(permissions)) throw new Error("permissions must be a comma-separated allow list");
-          a.push("--permissions", permissions);
-        }
-        const mdl = assertModel(model);
-        if (mdl) a.push("--model", mdl);
-        const r = runOpencodeSync(a, undefined, 30000);
-        return { content: [{ type: "text", text: JSON.stringify({ ok: r.ok, stdout: r.stdout.slice(0, 4000), stderr: r.stderr.slice(0, 1000) }, null, 2) }], isError: r.ok ? undefined : true };
-      }
+      case "agent_create":
+        return opencodeFailure("Agent creation is unsupported on opencode v2: no agent create command");
       case "opencode_models": {
         const { provider, refresh, verbose } = args as any;
-        const a = ["models"];
-        if (provider !== undefined) {
-          if (typeof provider !== "string" || !/^[a-zA-Z0-9_-]{1,64}$/.test(provider)) throw new Error("invalid provider");
-          a.push(provider);
+        if (provider !== undefined && (typeof provider !== "string" || !/^[a-zA-Z0-9_-]{1,64}$/.test(provider))) {
+          throw new Error("invalid provider");
         }
-        if (refresh === true) a.push("--refresh");
-        if (verbose === true) a.push("--verbose");
-        const r = runOpencodeSync(a, undefined, 60000);
-        return { content: [{ type: "text", text: (r.stdout || r.stderr || r.error || "").slice(0, 8000) }], isError: r.ok ? undefined : true };
+        if (refresh === true) return opencodeFailure("Model refresh is unsupported on opencode v2: models has no --refresh flag");
+        if (verbose === true) return opencodeFailure("Verbose model output is unsupported on opencode v2: models has no --verbose flag");
+        const r = runOpencodeSync(["models"], undefined, 60000);
+        const output = r.ok && provider !== undefined
+          ? r.stdout.split(/\r?\n/).filter(line => line.startsWith(`${provider}/`)).join("\n")
+          : r.stdout || r.stderr || r.error || "";
+        return { content: [{ type: "text", text: output.slice(0, 8000) }], isError: r.ok ? undefined : true };
       }
       case "opencode_stats": {
         const { days, topTools, topModels, project } = args as any;
@@ -709,8 +704,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       case "opencode_export": {
         const { sessionId, sanitize } = args as any;
-        if (typeof sessionId !== "string" || !/^[0-9a-f-]{8,64}$/i.test(sessionId)) throw new Error("invalid sessionId");
-        const a = ["export", sessionId];
+        const a = ["session", "export", assertOpencodeSessionId(sessionId)];
         if (sanitize === true) a.push("--sanitize");
         const r = runOpencodeSync(a, undefined, 30000);
         return { content: [{ type: "text", text: (r.stdout || r.stderr || r.error || "").slice(0, 20000) }], isError: r.ok ? undefined : true };
@@ -718,12 +712,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "opencode_import": {
         const { file } = args as any;
         const f = assertSafePath(file, "file");
-        const r = runOpencodeSync(["import", f], undefined, 30000);
+        const r = runOpencodeSync(["session", "import", "--", f], undefined, 30000);
         return { content: [{ type: "text", text: JSON.stringify({ ok: r.ok, stdout: r.stdout.slice(0, 4000), stderr: r.stderr.slice(0, 1000) }, null, 2) }], isError: r.ok ? undefined : true };
       }
       case "opencode_session_delete": {
-        const { sessionId } = args as any;
-        if (typeof sessionId !== "string" || !/^[0-9a-f-]{8,64}$/i.test(sessionId)) throw new Error("invalid sessionId");
+        const sessionId = assertOpencodeSessionId(args?.sessionId);
         const r = runOpencodeSync(["session", "delete", sessionId]);
         return { content: [{ type: "text", text: JSON.stringify({ sessionId, deleted: r.ok, detail: (r.stdout || r.stderr || "").slice(0, 500) }, null, 2) }], isError: r.ok ? undefined : true };
       }
@@ -735,20 +728,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const r = runOpencodeSync(["auth", "list"], undefined, 30000);
         return { content: [{ type: "text", text: (r.stdout || r.stderr || r.error || "").slice(0, 4000) }], isError: r.ok ? undefined : true };
       }
-      case "opencode_db": {
-        const { query, format } = args as any;
-        const a = ["db"];
-        if (query !== undefined) {
-          if (typeof query !== "string" || !query.trim() || query.length > 2000) throw new Error("query must be 1-2000 chars");
-          a.push(query);
-        }
-        if (format !== undefined) {
-          if (format !== "json" && format !== "tsv") throw new Error("format must be json|tsv");
-          a.push("--format", format);
-        }
-        const r = runOpencodeSync(a, undefined, 30000);
-        return { content: [{ type: "text", text: (r.stdout || r.stderr || r.error || "").slice(0, 8000) }], isError: r.ok ? undefined : true };
-      }
+      case "opencode_db":
+        return opencodeFailure("Database inspection is unsupported on opencode v2: no db command");
       case "opencode_server_spawn": {
         const { mode, port, hostname, name } = args as any;
         if (mode !== "serve" && mode !== "web" && mode !== "acp") throw new Error("mode must be serve|web|acp");
@@ -764,7 +745,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       case "opencode_status": {
         const ver = runOpencodeSync(["--version"], undefined, 10000);
-        const agents = runOpencodeSync(["agent", "list"], undefined, 10000);
+        let agentsOutput = "";
+        if (ver.ok) {
+          const agents = runOpencodeSync(["debug", "agents"], undefined, 10000);
+          if (agents.ok) {
+            const definitions: { id: string; name: string; mode: string }[] = JSON.parse(agents.stdout);
+            // Debug output also contains provider request headers and settings.
+            agentsOutput = JSON.stringify(definitions.map(({ id, name, mode }) => ({ id, name, mode })));
+          }
+        }
         const tracked = sessionManager.listSessions();
         const agentSessions = tracked.filter((s: any) => s.meta?.kind === "agent");
         return {
@@ -774,7 +763,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               bin: OPENCODE_BIN,
               available: ver.ok,
               version: (ver.stdout || ver.stderr || "").trim().slice(0, 100),
-              agentsOutput: (agents.stdout || agents.stderr || "").slice(0, 2000),
+              agentsOutput: agentsOutput.slice(0, 2000),
               trackedSessions: tracked.length,
               trackedAgents: agentSessions.length,
               runningAgents: agentSessions.filter((s: any) => s.status === "running").length
@@ -786,6 +775,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         throw new Error(`Unknown tool: ${name}`);
     }
   } catch (error: any) {
+    if (error instanceof OpencodeUsageError) return opencodeFailure(error.message);
     return {
       isError: true,
       content: [{ type: "text", text: JSON.stringify({ error: error.message || String(error) }) }],

@@ -1,5 +1,24 @@
 import os from "node:os";
 import path from "node:path";
+import stripAnsi from "strip-ansi";
+
+const SESSION_ID_RE = /^(?:ses_[A-Za-z0-9]{8,64}|[A-Fa-f0-9]{8}(?:-[A-Fa-f0-9]{4}){3}-[A-Fa-f0-9]{12})$/;
+
+export function assertOpencodeSessionId(value: unknown): string {
+  if (typeof value !== "string" || !SESSION_ID_RE.test(value)) throw new Error("invalid sessionId");
+  return value;
+}
+
+export function opencodeUsageError(stdout: string, stderr: string): string | undefined {
+  const output = stripAnsi(`${stderr}\n${stdout}`);
+  const diagnostic = /^[ \t]*(Unrecognized flag(?::[^\r\n]*)?)[ \t]*$/m.exec(output);
+  if (diagnostic) return diagnostic[1].trim();
+
+  const usage = /^[ \t]*USAGE[ \t]*(?::[ \t]*|\r?\n[ \t]+)(opencode\b[^\r\n]*)/im.exec(output);
+  if (!usage) return undefined;
+  const positionalError = /^[ \t]*(Unexpected positional argument:[^\r\n]*)/m.exec(output);
+  return positionalError?.[1].trim() ?? `Usage: ${usage[1].trim()}`;
+}
 
 export interface StatsArgsInput {
   days?: unknown;
