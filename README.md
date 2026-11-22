@@ -1,7 +1,7 @@
 # Menager MCP Server
 
 <!-- hela:version:start -->
-**MCP server:** `hela-ribosome` · **Version:** `3.2.2` · **Canonical tools:** 28. [Current tool reference](docs/TOOLS.md).
+**MCP server:** `hela-ribosome` · **Version:** `3.2.3` · **Canonical tools:** 28. [Current tool reference](docs/TOOLS.md).
 <!-- hela:version:end -->
 
 

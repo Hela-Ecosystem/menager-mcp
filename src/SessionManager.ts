@@ -600,7 +600,11 @@ export class Session {
       hook.echoPending = undefined;
       return chunk.slice(0, at) + chunk.slice(at + echo.length);
     }
-    if (!chunk.includes('\n')) return chunk;
+    // A bare newline (the Enter key's own echo, or a prompt refresh) must not
+    // consume the pending echo: the command line can arrive in a later chunk.
+    if (!chunk.includes('\n') || chunk.trim() === '') return chunk.trim() === '' ? '' : chunk;
+    // Real content arrived but the echo did not (a non-echoing terminal): stop
+    // waiting and drop the leading command line if it looks like a wrap of it.
     hook.echoPending = undefined;
     const head = echo.slice(0, 12);
     if (head && chunk.startsWith(head)) {

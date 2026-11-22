@@ -3,6 +3,11 @@
 ### Fixed
 - `session_read` `lines` mode replays carriage-return overwrites when `stripAnsi` is set, so prompt redraws no longer surface as interleaved echo fragments (`<cho MARKER-START; …`) ahead of the real output. `stripAnsi: false` still returns the untouched raw stream. (`menager-mcp#17`)
 
+## [3.2.3] - 2026-11-23
+
+### Fixed
+- The hook trigger-echo strip no longer treats a bare newline (the Enter key's own echo or a prompt refresh) as the end of the echo. The command line can arrive in a later chunk, so the strip now waits for the echo or real content; this removes a race that made `menager#21`'s regression flake under CI load.
+
 ## [3.2.2] - 2026-11-23
 
 ### Fixed
