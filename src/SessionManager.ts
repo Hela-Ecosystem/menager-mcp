@@ -173,9 +173,22 @@ interface SessionHook {
   reject: (err: Error) => void;
   timeout: NodeJS.Timeout;
   autoResponse?: string;
+  /** Echo of the trigger still to be discarded; output starts after it. */
+  echoPending?: string;
+  /** Text observed since the hook was registered (capped), not the scrollback. */
+  seen?: string;
 }
 
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+
+/** Text kept per hook for cross-chunk patterns; bounded so a chatty session cannot grow it. */
+const HOOK_SEEN_LIMIT = 64 * 1024;
+
+/** The terminal echoes the first line of a payload as written (without the newline). */
+function triggerEcho(payload: string): string | undefined {
+  const line = payload.replace(/\r\n/g, '\n').split('\n')[0].trim();
+  return line || undefined;
+}
 
 /** Grace for the lazy `@xterm/headless` import only; data settling is opt-in via `settleMs`. */
 const SCREEN_READY_GRACE_MS = 250;
@@ -314,16 +327,20 @@ export class Session {
       this.cleanLines.shift();
     }
 
-    const latestCleanText = this.cleanLines.slice(-chunks.length).join('\n');
+    let latestCleanText = this.cleanLines.slice(-chunks.length).join('\n');
 
     for (const hook of this.hooks) {
-      if (hook.pattern.test(latestCleanText) || hook.pattern.test(this.cleanLines.join('\n'))) {
+      const chunk = this.stripTriggerEcho(hook, latestCleanText);
+      // Accumulate only text observed after registration: matching the whole buffer
+      // let an old occurrence of the marker satisfy a fresh hook (menager-mcp#21).
+      hook.seen = `${hook.seen ?? ''}\n${chunk}`.slice(-HOOK_SEEN_LIMIT);
+      if (hook.pattern.test(hook.seen)) {
         clearTimeout(hook.timeout);
         this.hooks.delete(hook);
         if (hook.autoResponse) {
           this.write(hook.autoResponse, true).catch(() => {});
         }
-        hook.resolve(latestCleanText);
+        hook.resolve(hook.seen);
       }
     }
   }
@@ -444,7 +461,9 @@ export class Session {
   public hook(pattern: RegExp, timeoutMs: number, autoResponse?: string, triggerPayload?: string): Promise<string> {
     return new Promise((resolve, reject) => {
       const existingData = this.cleanLines.join('\n');
-      if (pattern.test(existingData)) {
+      // With a trigger, the marker must come from what the payload produces — not from
+      // text already on screen, which may hold an earlier run's marker.
+      if (!triggerPayload && pattern.test(existingData)) {
         if (autoResponse) {
           this.write(autoResponse, true);
         }
@@ -466,7 +485,9 @@ export class Session {
         resolve,
         reject,
         timeout,
-        autoResponse
+        autoResponse,
+        echoPending: triggerPayload ? triggerEcho(triggerPayload) : undefined,
+        seen: ''
       };
 
       this.hooks.add(hookObj);
@@ -475,6 +496,29 @@ export class Session {
         this.write(triggerPayload, true);
       }
     });
+  }
+
+  /**
+   * Terminals echo what is written to them, so the first lines after a trigger contain
+   * the command itself. Drop that echo before the marker is looked for; a payload whose
+   * echo never arrives (non-echoing PTY) still matches from the next chunk.
+   */
+  private stripTriggerEcho(hook: SessionHook, chunk: string): string {
+    const echo = hook.echoPending;
+    if (!echo) return chunk;
+    const at = chunk.indexOf(echo);
+    if (at !== -1) {
+      hook.echoPending = undefined;
+      return chunk.slice(0, at) + chunk.slice(at + echo.length);
+    }
+    if (!chunk.includes('\n')) return chunk;
+    hook.echoPending = undefined;
+    const head = echo.slice(0, 12);
+    if (head && chunk.startsWith(head)) {
+      const newline = chunk.indexOf('\n');
+      return chunk.slice(newline + 1);
+    }
+    return chunk;
   }
 
   public signal(signal: 'SIGINT' | 'SIGTERM' | 'SIGKILL') {
