@@ -27,6 +27,7 @@ export interface AgentMeta {
   title?: string;
   promptPreview?: string;
   opencodeSessionId?: string | null;
+  opencodeLookupTitle?: string;
   parentSessionId?: string | null;
   /** P0-B4: RunStore linkage — every spawn carries run/step identity when run under a workflow. */
   run_id?: string | null;
@@ -236,10 +237,11 @@ export class Session {
   private hooks: Set<SessionHook> = new Set();
   private waitPromises: Array<{resolve: (code: number | null) => void, reject: (err: Error) => void, timeout?: NodeJS.Timeout}> = [];
   private screen?: ScreenBuffer;
-  private readonly cwd: string;
+  public readonly cwd: string;
   private readonly childEnv: Record<string, string>;
   private readonly terminalType: string;
   private readonly redactServerPassword: boolean;
+  private readonly opencodeJsonOutput: boolean;
   private pendingServerLine: string | null = '';
   private cols: number;
   private rows: number;
@@ -272,6 +274,7 @@ export class Session {
     this.maxBufferLines = maxBufferLines;
     this.createdAt = new Date().toISOString();
     this.cwd = cwd;
+    this.opencodeJsonOutput = args.some((arg, index) => arg === '--format' && args[index + 1] === 'json');
     this.terminalType = terminalType;
     this.cols = cols;
     this.rows = rows;
@@ -308,6 +311,7 @@ export class Session {
       if (this.redactServerPassword && this.pendingServerLine !== '') {
         this.handleData(this.finishServerLine());
       }
+      this.captureOpencodeSessionId(this.cleanLines.slice(-1));
       if (this.transport === 'ssh') {
         this.exitKind = event.exitCode === SSH_TRANSPORT_EXIT_CODE ? 'transport' : 'remote';
       }
@@ -363,6 +367,10 @@ export class Session {
     for (let i = 1; i < chunks.length; i++) {
       this.rawLines.push(chunks[i]);
       this.cleanLines.push(stripAnsi(chunks[i]));
+    }
+
+    if (chunks.length > 1 && this.opencodeJsonOutput && !this.meta.opencodeSessionId) {
+      this.captureOpencodeSessionId(this.cleanLines.slice(-chunks.length, -1));
     }
 
     while (this.rawLines.length > this.maxBufferLines) {
@@ -681,8 +689,10 @@ export class Session {
     return race(deadlineMs - half);
   }
 
-  public resolveOpencodeSessionId(): string | null {
-    return resolveOpencodeSessionId(this.cleanLines);
+  private captureOpencodeSessionId(lines: string[]) {
+    if (!this.opencodeJsonOutput || this.meta.kind !== 'agent' || this.meta.opencodeSessionId) return;
+    const id = resolveOpencodeSessionId(lines);
+    if (id) this.meta.opencodeSessionId = id;
   }
 
   public getInfo(): SessionInfo {

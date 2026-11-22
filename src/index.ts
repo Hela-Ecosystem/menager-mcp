@@ -7,9 +7,10 @@ import {
   Tool
 } from "@modelcontextprotocol/sdk/types.js";
 import { spawnSync } from "node:child_process";
-import { resolve } from "node:path";
-import { SessionExitedError, SessionManager } from "./SessionManager.js";
-import { assertOpencodeSessionId, buildStatsArgs, opencodeHostEnv, opencodeUsageError } from "./opencode-cli.js";
+import { randomUUID } from "node:crypto";
+import { isAbsolute, relative, resolve, sep } from "node:path";
+import { type Session, SessionExitedError, SessionManager } from "./SessionManager.js";
+import { assertOpencodeSessionId, buildStatsArgs, isOpencodeSessionId, opencodeHostEnv, opencodeUsageError } from "./opencode-cli.js";
 import { VERSION } from "./version.js";
 
 const sessionManager = new SessionManager();
@@ -57,10 +58,11 @@ function assertServerUrl(value: unknown): string | undefined {
   return value;
 }
 
-function buildRunArgs(o: { message: string; session?: string; fork?: boolean; model?: string; agent?: string; format?: string; title?: string; attach?: string }): string[] {
+function buildRunArgs(o: { message: string; session?: string; latest?: boolean; fork?: boolean; model?: string; agent?: string; format?: string; title?: string; attach?: string }): string[] {
   const a = ["run"];
   if (o.attach) a.unshift("--server", o.attach);
-  if (o.session) { a.push("--session", o.session); }
+  if (o.session) a.push("--session", o.session);
+  else if (o.latest) a.push("--continue");
   if (o.fork) {
     if (!o.session) throw new Error("fork requires session");
     a.push("--fork");
@@ -88,8 +90,8 @@ function assertPort(v: unknown): number | undefined {
 
 class OpencodeUsageError extends Error {}
 
-function opencodeFailure(error: string) {
-  return { isError: true, content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error }) }] };
+function opencodeFailure(error: string, hint?: string) {
+  return { isError: true, content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error, ...(hint && { reason: error, hint }) }) }] };
 }
 
 function runOpencodeSync(args: string[], cwd?: string, timeoutMs = 15000): { ok: boolean; stdout: string; stderr: string; error?: string } {
@@ -99,6 +101,48 @@ function runOpencodeSync(args: string[], cwd?: string, timeoutMs = 15000): { ok:
   const usageError = opencodeUsageError(stdout, stderr);
   if (usageError) throw new OpencodeUsageError(usageError);
   return { ok: result.status === 0, stdout, stderr, error: result.error?.message };
+}
+
+function opencodeAttach(session: Session): string | undefined {
+  return session.args[0] === "--server" ? session.args[1] : undefined;
+}
+
+function resolveAgentSessionId(session: Session): string | null {
+  const { kind, opencodeSessionId, opencodeLookupTitle } = session.meta;
+  if (kind !== "agent") return null;
+  if (isOpencodeSessionId(opencodeSessionId)) return opencodeSessionId;
+  if (!opencodeLookupTitle) return null;
+
+  const command = ["session", "list", "--format", "json"];
+  const attach = opencodeAttach(session);
+  if (attach) command.unshift("--server", attach);
+  try {
+    const result = runOpencodeSync(command, session.cwd);
+    if (!result.ok) return null;
+    const rows: unknown = JSON.parse(result.stdout);
+    if (!Array.isArray(rows)) return null;
+    const ids = new Set<string>();
+    for (const row of rows) {
+      if (row?.title !== opencodeLookupTitle || !isOpencodeSessionId(row.id)) continue;
+      if (typeof row.directory !== "string" || !isAbsolute(row.directory)) continue;
+      // OpenCode can record the project root for a run launched in a subdirectory.
+      const fromDirectory = relative(row.directory, session.cwd);
+      if (!isAbsolute(fromDirectory) && fromDirectory.split(sep)[0] !== "..") ids.add(row.id);
+    }
+    if (ids.size !== 1) return null;
+    const [id] = ids;
+    session.meta.opencodeSessionId = id;
+    return id;
+  } catch {
+    return null;
+  }
+}
+
+function opencodeResolutionHint(session: Session): string {
+  const sources = session.meta.opencodeLookupTitle
+    ? `opencode session list --format json for title ${JSON.stringify(session.meta.opencodeLookupTitle)}`
+    : "PTY output for a JSON event with a valid OpenCode session ID";
+  return `Searched ${sources} for tracked session ${session.id} in ${session.cwd}.`;
 }
 
 const server = new Server(
@@ -277,7 +321,7 @@ const TOOLS: Tool[] = [
         model: { type: "string", description: "provider/model (e.g. opencode/muse-spark-1.3-free)" },
         cwd: { type: "string", description: "Working directory for the agent run" },
         title: { type: "string", description: "Session title" },
-        format: { type: "string", enum: ["default", "json"], description: "opencode output format" },
+        format: { type: "string", enum: ["default", "json"], description: "OpenCode output format (JSON by default). Formatted output uses a unique suffix in the OpenCode title for routing." },
         share: { type: "boolean", description: "Legacy option. Sharing is unsupported on opencode v2." },
         attach: { type: "string", description: "Connect to a running opencode server URL (--server)" },
         name: { type: "string", description: "Logical name for routing" },
@@ -291,14 +335,15 @@ const TOOLS: Tool[] = [
   },
   {
     name: "agent_send",
-    description: "Send a follow-up message to an agent session. Writes into the running PTY, or resumes via opencode run --session when the PTY already exited.",
+    description: "Send a follow-up to a tracked agent. Writes into its running PTY or resumes its exact OpenCode session. Omit sessionId to resume the latest session in cwd.",
     inputSchema: {
       type: "object",
       properties: {
-        sessionId: { type: "string" },
+        sessionId: { type: "string", description: "Tracked menager session ID. Omit to resume the latest OpenCode session." },
+        cwd: { type: "string", description: "Working directory when sessionId is omitted (defaults to the server's working directory)." },
         message: { type: "string" }
       },
-      required: ["sessionId", "message"]
+      required: ["message"]
     }
   },
   {
@@ -600,16 +645,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: "text", text: JSON.stringify(list, null, 2) }] };
       }
       case "agent_spawn": {
-        const { prompt: rawPrompt, agent: rawAgent, model: rawModel, cwd = process.cwd(), title, format, share, attach, name, cols, rows, run_id, step_id } = args as any;
+        const { prompt: rawPrompt, agent: rawAgent, model: rawModel, cwd: rawCwd = process.cwd(), title: rawTitle, format, share, attach, name, cols, rows, run_id, step_id } = args as any;
         if (share === true) return opencodeFailure("Sharing is unsupported on opencode v2: run has no --share flag");
         const prompt = assertPrompt(rawPrompt);
         const agent = assertAgent(rawAgent);
         const model = assertModel(rawModel);
-        const fmt = format === "json" ? "json" : undefined;
-        const runArgs = buildRunArgs({ message: prompt, model, agent, format: fmt, title: typeof title === "string" ? title : undefined, attach: assertServerUrl(attach) });
+        const cwd = resolve(rawCwd);
+        const title = typeof rawTitle === "string" ? rawTitle.slice(0, 120) : undefined;
+        const fmt = format === "default" ? undefined : "json";
+        const suffix = fmt === undefined ? ` [menager:${randomUUID()}]` : undefined;
+        const opencodeLookupTitle = suffix ? (title || "Agent").slice(0, 120 - suffix.length) + suffix : undefined;
+        const runArgs = buildRunArgs({ message: prompt, model, agent, format: fmt, title: opencodeLookupTitle ?? title, attach: assertServerUrl(attach) });
         const info = sessionManager.spawn(OPENCODE_BIN, runArgs, cwd, OPENCODE_ENV, 5000, "xterm-256color", name, cols, rows, undefined, {
-          kind: "agent", agent, model, dir: cwd,
-          title: typeof title === "string" ? title.slice(0, 120) : undefined,
+          kind: "agent", agent, model, dir: cwd, title, opencodeLookupTitle,
           promptPreview: prompt.slice(0, 200),
           run_id: typeof run_id === "string" ? run_id : null,
           step_id: typeof step_id === "string" ? step_id : null
@@ -617,31 +665,42 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
       }
       case "agent_send": {
-        const { sessionId, message: rawMessage } = args as any;
+        const { sessionId, message: rawMessage, cwd } = args ?? {};
         const message = assertPrompt(rawMessage);
+        if (sessionId === undefined) {
+          const dir = cwd === undefined ? process.cwd() : resolve(assertSafePath(cwd, "cwd"));
+          const runArgs = buildRunArgs({ message, latest: true, format: "json" });
+          const next = sessionManager.spawn(OPENCODE_BIN, runArgs, dir, OPENCODE_ENV, 5000, "xterm-256color", undefined, undefined, undefined, undefined, {
+            kind: "agent", dir, promptPreview: message.slice(0, 200)
+          });
+          return { content: [{ type: "text", text: JSON.stringify({ resumed: true, via: "latest", next }, null, 2) }] };
+        }
+        if (typeof sessionId !== "string" || !sessionManager.hasSession(sessionId)) {
+          return opencodeFailure("Unknown tracked agent session ID", "Searched this menager server's tracked sessions. Use a sessionId returned by agent_spawn or agent_list.");
+        }
         const session = sessionManager.getSession(sessionId);
         if (session.status === "running") {
           const bytes = await session.write(message, true);
           return { content: [{ type: "text", text: JSON.stringify({ sessionId, delivered: true, via: "pty-write", bytesWritten: bytes }, null, 2) }] };
         }
-        const opencodeId = session.meta.opencodeSessionId || session.resolveOpencodeSessionId();
-        const runArgs = buildRunArgs({ message, session: opencodeId || undefined, model: session.meta.model, agent: session.meta.agent, format: undefined });
-        if (!opencodeId) runArgs.splice(1, 0, "--continue");
-        const info = sessionManager.spawn(OPENCODE_BIN, runArgs, session.meta.dir || process.cwd(), OPENCODE_ENV, 5000, "xterm-256color", session.name, undefined, undefined, undefined, {
+        const opencodeId = resolveAgentSessionId(session);
+        if (!opencodeId) return opencodeFailure("Could not resolve the addressed OpenCode session ID", opencodeResolutionHint(session));
+        const runArgs = buildRunArgs({ message, session: opencodeId, model: session.meta.model, agent: session.meta.agent, attach: opencodeAttach(session) });
+        const info = sessionManager.spawn(OPENCODE_BIN, runArgs, session.cwd, OPENCODE_ENV, 5000, "xterm-256color", session.name, undefined, undefined, undefined, {
           kind: "agent", agent: session.meta.agent, model: session.meta.model, dir: session.meta.dir,
           promptPreview: message.slice(0, 200), parentSessionId: sessionId, opencodeSessionId: opencodeId,
           run_id: session.meta.run_id ?? null, step_id: session.meta.step_id ?? null
         });
-        return { content: [{ type: "text", text: JSON.stringify({ resumed: true, via: opencodeId ? "opencode-session" : "opencode-continue", previousSessionId: sessionId, next: info }, null, 2) }] };
+        return { content: [{ type: "text", text: JSON.stringify({ resumed: true, via: "opencode-session", previousSessionId: sessionId, next: info }, null, 2) }] };
       }
       case "agent_fork": {
         const { sessionId, message: rawMessage, name } = args as any;
         const message = assertPrompt(rawMessage);
         const session = sessionManager.getSession(sessionId);
-        const opencodeId = session.meta.opencodeSessionId || session.resolveOpencodeSessionId();
-        if (!opencodeId) throw new Error("cannot fork: no opencode session id resolved yet (agent may still be starting; use agent_info to check, then retry)");
-        const runArgs = buildRunArgs({ message, session: opencodeId, fork: true, model: session.meta.model, agent: session.meta.agent });
-        const info = sessionManager.spawn(OPENCODE_BIN, runArgs, session.meta.dir || process.cwd(), OPENCODE_ENV, 5000, "xterm-256color", typeof name === "string" ? name : undefined, undefined, undefined, undefined, {
+        const opencodeId = resolveAgentSessionId(session);
+        if (!opencodeId) return opencodeFailure("Cannot fork without a resolved OpenCode session ID", opencodeResolutionHint(session));
+        const runArgs = buildRunArgs({ message, session: opencodeId, fork: true, model: session.meta.model, agent: session.meta.agent, format: "json", attach: opencodeAttach(session) });
+        const info = sessionManager.spawn(OPENCODE_BIN, runArgs, session.cwd, OPENCODE_ENV, 5000, "xterm-256color", typeof name === "string" ? name : undefined, undefined, undefined, undefined, {
           kind: "agent", agent: session.meta.agent, model: session.meta.model, dir: session.meta.dir,
           promptPreview: message.slice(0, 200), parentSessionId: sessionId,
           run_id: session.meta.run_id ?? null, step_id: session.meta.step_id ?? null
@@ -676,16 +735,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const { sessionId, tailLines = 20 } = args as any;
         const session = sessionManager.getSession(sessionId);
         const n = Math.min(Math.max(Number(tailLines) || 20, 1), 100);
-        const resolved = session.meta.opencodeSessionId || session.resolveOpencodeSessionId();
-        if (resolved && !session.meta.opencodeSessionId) sessionManager.setMeta(sessionId, { opencodeSessionId: resolved });
+        const resolved = resolveAgentSessionId(session);
         return { content: [{ type: "text", text: JSON.stringify({ ...session.getInfo(), resolvedOpencodeSessionId: resolved, preview: session.getLines(n, true) }, null, 2) }] };
       }
       case "agent_close": {
         const { sessionId, deleteOpencodeSession = false } = args as any;
         const session = sessionManager.hasSession(sessionId) ? sessionManager.getSession(sessionId) : undefined;
-        const opencodeSessionId = session?.meta.kind === "agent"
-          ? session.meta.opencodeSessionId || session.resolveOpencodeSessionId()
-          : null;
+        const opencodeSessionId = session ? resolveAgentSessionId(session) : null;
         const { closed } = sessionManager.closeSession(sessionId);
         const result = { sessionId, closed, opencodeSessionId };
         if (!deleteOpencodeSession) {

@@ -206,8 +206,8 @@ The wrappers target OpenCode v2. Each spawned agent runs in its own PTY session 
 
 | Tool | Maps to | Purpose |
 | :--- | :--- | :--- |
-| `agent_spawn` | `opencode [--server <url>] run "<prompt>"` | Spawn an agent in a managed PTY. Pass the server URL as `attach`. |
-| `agent_send` | PTY write, or `opencode run --session <id> "<msg>"` (falls back to `--continue`) | Follow-up message to a live or exited agent. |
+| `agent_spawn` | `opencode [--server <url>] run --format json "<prompt>"` | Spawn an agent in a managed PTY. Pass the server URL as `attach`. To get formatted output, set `format: "default"`. Menager adds a unique suffix to the OpenCode title for formatted runs. |
+| `agent_send` | PTY write, `opencode run --session <id> "<msg>"`, or `opencode run --continue "<msg>"` | An explicit `sessionId` targets that agent and returns an error if its native ID cannot be resolved. Omit the ID to resume the latest session in `cwd` with `via: "latest"`. |
 | `agent_fork` | `opencode run --session <id> --fork "<msg>"` | Branch a session into a new tracked session. |
 | `agent_list` | menager tracking + `opencode session list --format json` | Query each tracked working directory once and merge unique native sessions. `maxCount` caps the merged list (default 20, maximum 50). |
 | `agent_info` | session metadata + resolved opencode id + output preview | Inspect one agent. |

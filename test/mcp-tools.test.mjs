@@ -267,6 +267,133 @@ async function fakeOpencode(t, script) {
   return { bin, dir };
 }
 
+const ROUTING_FIRST = 'ses_first12345678';
+const ROUTING_SECOND = 'ses_second12345678';
+
+async function routingFixture(t) {
+  const { bin, dir } = await fakeOpencode(t, `
+case "$1:$2" in
+  session:list)
+    printf '%s\\n' "$PWD" >> .searches
+    printf '[{"id":"${ROUTING_SECOND}","title":"%s","directory":"%s/other"},' "$(cat .title)" "$PWD"
+    printf '{"id":"${ROUTING_SECOND}","title":"Named agent","directory":"%s"},' "$PWD"
+    printf '{"id":"${ROUTING_FIRST}","title":"%s","directory":"%s"}]\\n' "$(cat .title)" "$PWD"
+    exit 0 ;;
+  run:*) shift ;;
+  *) exit 2 ;;
+esac
+while [ "$#" -gt 0 ] && [ "$1" != -- ]; do
+  case "$1" in
+    --session) target=$2; shift ;;
+    --continue) target=$(cat .latest) ;;
+    --format) format=$2; shift ;;
+    --title=*) printf '%s\\n' "\${1#--title=}" > .title ;;
+    *) exit 2 ;;
+  esac
+  shift
+done
+case "$2" in
+  first) target=${ROUTING_FIRST}; reply='no codeword' ;;
+  second) target=${ROUTING_SECOND}; reply=BLUEBIRD ;;
+  unresolved) printf 'no session was created\\n'; exit 0 ;;
+  follow-up)
+    printf '%s\\n' "$target" >> .deliveries
+    if [ "$target" = '${ROUTING_FIRST}' ]; then reply='no codeword'; else reply=BLUEBIRD; fi ;;
+  *) exit 2 ;;
+esac
+printf '%s\\n' "$target" > .latest
+if [ "$format" = json ]; then
+  printf '{"type":"step_start","sessionID":"%s"}\\n' "$target"
+else
+  printf '${ROUTING_SECOND}\\n'
+fi
+printf '%s\\n' "$reply"
+`);
+  const cwd = path.join(dir, 'project');
+  await mkdir(cwd);
+  const client = mcpClient({ OPENCODE_BIN: bin }, dir);
+  t.after(() => client.close());
+  await client.init();
+  async function wait(sessionId) {
+    const result = await client.call('session_wait', { sessionId, timeoutMs: 5000 });
+    assert.equal(result.json?.exitCode, 0, result.text);
+  }
+  async function start(prompt, options = {}) {
+    const result = await client.call('agent_spawn', { cwd, prompt, ...options });
+    assert.equal(result.isError, false, result.text);
+    await wait(result.json.sessionId);
+    return result.json.sessionId;
+  }
+  return { client, cwd, start, wait };
+}
+
+test('agent_send resumes the addressed v2 agent when another agent is newer in the same directory', async (t) => {
+  const { client, cwd, start, wait } = await routingFixture(t);
+  const first = await start('first');
+  await start('second');
+
+  // Resolving must survive clearing the PTY's scrollback before the first send.
+  await client.call('session_read', { sessionId: first, clearBuffer: true });
+  for (let i = 0; i < 2; i++) {
+    const result = await client.call('agent_send', { sessionId: first, message: 'follow-up' });
+    assert.equal(result.isError, false, result.text);
+    await wait(result.json.next.sessionId);
+    const output = await client.call('session_read', { sessionId: result.json.next.sessionId });
+    assert.match(output.text, /no codeword/);
+    assert.doesNotMatch(output.text, /BLUEBIRD/);
+    assert.equal(result.json.via, 'opencode-session');
+    assert.equal(result.json.previousSessionId, first);
+  }
+  assert.equal(await readFile(path.join(cwd, '.deliveries'), 'utf8'), `${ROUTING_FIRST}\n`.repeat(2));
+  const info = await client.call('agent_info', { sessionId: first });
+  assert.equal(info.json.meta.opencodeSessionId, ROUTING_FIRST);
+});
+
+test('agent_send refuses unknown and unresolved addresses without delivering a message', async (t) => {
+  const { client, cwd, start } = await routingFixture(t);
+  const unresolved = await start('unresolved');
+  await start('second');
+  for (const sessionId of [unresolved, 'missing-agent', '', null]) {
+    const result = await client.call('agent_send', { sessionId, cwd, message: 'follow-up' });
+    assert.equal(result.isError, true, result.text);
+    assert.equal(result.json.ok, false);
+    assert.match(result.json.reason, /session/i);
+    assert.match(result.json.hint, sessionId === unresolved ? /PTY output/ : /tracked/i);
+    if (sessionId === unresolved) assert.ok(result.json.hint.includes(cwd), result.text);
+  }
+  assert.equal((await client.call('agent_list', { includeOpencode: false })).json.tracked.length, 2);
+  await assert.rejects(readFile(path.join(cwd, '.deliveries')), { code: 'ENOENT' });
+});
+
+test('agent_send without a sessionId explicitly resumes the latest session in cwd', async (t) => {
+  const { client, cwd, start, wait } = await routingFixture(t);
+  await start('first');
+  await start('second');
+  const result = await client.call('agent_send', { cwd, message: 'follow-up' });
+  assert.equal(result.isError, false, result.text);
+  assert.equal(result.json.resumed, true);
+  assert.equal(result.json.via, 'latest');
+  assert.equal(result.json.previousSessionId, undefined);
+  await wait(result.json.next.sessionId);
+  assert.equal(await readFile(path.join(cwd, '.deliveries'), 'utf8'), `${ROUTING_SECOND}\n`);
+});
+
+test('agent_send resolves formatted output by the matching title and directory, then caches it', async (t) => {
+  const { client, cwd, start, wait } = await routingFixture(t);
+  const first = await start('first', { format: 'default', title: 'Named agent' });
+  await start('second');
+  for (let i = 0; i < 2; i++) {
+    const result = await client.call('agent_send', { sessionId: first, message: 'follow-up' });
+    assert.equal(result.isError, false, result.text);
+    await wait(result.json.next.sessionId);
+  }
+  assert.equal(await readFile(path.join(cwd, '.searches'), 'utf8'), `${cwd}\n`);
+  assert.equal(await readFile(path.join(cwd, '.deliveries'), 'utf8'), `${ROUTING_FIRST}\n`.repeat(2));
+  const info = await client.call('agent_info', { sessionId: first });
+  assert.equal(info.json.meta.title, 'Named agent');
+  assert.match(await readFile(path.join(cwd, '.title'), 'utf8'), /^Named agent \[menager:[0-9a-f-]+\]\n$/);
+});
+
 test('managed OpenCode server passwords are absent from PTY output and previews', async (t) => {
   assert.equal(TEST_SERVER_PASSWORD.length, 43);
   const { bin, dir } = await fakeOpencode(t, `
@@ -529,6 +656,7 @@ esac
     assert.equal(listed.length, 1);
     const { id: sessionId } = listed[0];
     assert.match(sessionId, /^ses_[A-Za-z0-9]+$/);
+    assert.equal((await call('agent_info', { sessionId: run.sessionId })).json.resolvedOpencodeSessionId, sessionId);
     const exported = await call('opencode_export', { sessionId });
     assert.equal(exported.json.info.id, sessionId);
     assert.equal(exported.json.messages[0].text, '--help');
@@ -541,6 +669,25 @@ esac
     assert.deepEqual((await call('agent_list')).json.opencode, []);
     assert.equal((await call('opencode_import', { file })).json.ok, true);
     assert.equal((await call('agent_list')).json.opencode[0].id, sessionId);
+
+    const formatted = (await call('agent_spawn', { prompt: 'Formatted session', title: 'Named agent', model, attach, format: 'default' })).json;
+    await call('session_wait', { sessionId: formatted.sessionId, timeoutMs: 12000 });
+    const formattedId = (await call('agent_info', { sessionId: formatted.sessionId })).json.resolvedOpencodeSessionId;
+    assert.match(formattedId, /^ses_[A-Za-z0-9]+$/);
+    assert.notEqual(formattedId, sessionId);
+    const followUp = (await call('agent_send', { sessionId: run.sessionId, message: 'Exact follow-up' })).json;
+    assert.equal(followUp.via, 'opencode-session');
+    await call('session_wait', { sessionId: followUp.next.sessionId, timeoutMs: 12000 });
+    const firstHistory = (await call('opencode_export', { sessionId })).json.messages;
+    const secondHistory = (await call('opencode_export', { sessionId: formattedId })).json.messages;
+    assert.ok(firstHistory.some(message => message.text === 'Exact follow-up'));
+    assert.ok(secondHistory.every(message => message.text !== 'Exact follow-up'));
+
+    const fork = (await call('agent_fork', { sessionId: formatted.sessionId, message: 'Fork follow-up' })).json;
+    await call('session_wait', { sessionId: fork.sessionId, timeoutMs: 12000 });
+    const forkId = (await call('agent_info', { sessionId: fork.sessionId })).json.resolvedOpencodeSessionId;
+    assert.match(forkId, /^ses_[A-Za-z0-9]+$/);
+    assert.notEqual(forkId, formattedId);
 
     await call('opencode_stats', { days: 0, topModels: 1, topTools: 1 });
     await call('opencode_mcp_list');

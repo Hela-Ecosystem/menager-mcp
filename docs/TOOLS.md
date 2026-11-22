@@ -26,7 +26,7 @@ List menager agent sessions, optionally merged with live opencode session list.
 
 ## `agent_send`
 
-Send a follow-up message to an agent session. Writes into the running PTY, or resumes via opencode run --session when the PTY already exited.
+Send a follow-up to a tracked agent. Writes into its running PTY or resumes its exact OpenCode session. Omit sessionId to resume the latest session in cwd.
 
 ## `agent_spawn`
 
