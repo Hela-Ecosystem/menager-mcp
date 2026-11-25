@@ -182,6 +182,17 @@ interface SessionHook {
 }
 
 const SERVER_PASSWORD_LINE_RE = /\bserver\s+password\b/i;
+const SERVER_PASSWORD_VALUE_RE = /\bserver\s+password\b[^A-Za-z0-9_-]*([A-Za-z0-9_-]{16,})/i;
+const SERVER_URL_RE = /https?:\/\/[^\s"'<>]+/i;
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '0.0.0.0', '::1', '[::1]', '::', '[::]']);
+
+/** Host:port identity of a server URL; every loopback/wildcard spelling is one host. */
+export function serverEndpointKey(value: string): string | undefined {
+  if (!URL.canParse(value)) return undefined;
+  const url = new URL(value);
+  const host = LOOPBACK_HOSTS.has(url.hostname) ? 'loopback' : url.hostname;
+  return `${url.protocol}//${host}:${url.port || (url.protocol === 'https:' ? '443' : '80')}`;
+}
 const SERVER_OUTPUT_LINE_LIMIT = 64 * 1024;
 
 /**
@@ -266,6 +277,9 @@ export class Session {
   private readonly redactServerPassword: boolean;
   private readonly opencodeJsonOutput: boolean;
   private pendingServerLine: string | null = '';
+  /** Generated credential of a managed server. Never serialised, logged or returned. */
+  private serverPassword?: string;
+  private serverEndpoint?: string;
   private cols: number;
   private rows: number;
   private readonly onCleanup?: () => void;
@@ -357,8 +371,15 @@ export class Session {
     const line = this.pendingServerLine;
     this.pendingServerLine = '';
     if (line === null) return '[oversized server output line omitted]';
-    if (SERVER_PASSWORD_LINE_RE.test(stripAnsi(line))) {
+    const plain = stripAnsi(line);
+    if (SERVER_PASSWORD_LINE_RE.test(plain)) {
+      const password = SERVER_PASSWORD_VALUE_RE.exec(plain)?.[1];
+      if (password) this.serverPassword = password;
       return '[redacted server password]' + (line.endsWith('\r') ? '\r' : '');
+    }
+    if (!this.serverEndpoint) {
+      const url = SERVER_URL_RE.exec(plain)?.[0];
+      this.serverEndpoint = url && serverEndpointKey(url);
     }
     return line;
   }
@@ -722,6 +743,22 @@ export class Session {
     if (id) this.meta.opencodeSessionId = id;
   }
 
+  /** Credential for attaching to this managed server at `url`; undefined for any other URL. */
+  public serverPasswordFor(url: string): string | undefined {
+    if (!this.serverPassword || this.status !== 'running') return undefined;
+    const target = serverEndpointKey(url);
+    if (!target) return undefined;
+    const portFlag = this.args.indexOf('--port');
+    const hostFlag = this.args.indexOf('--hostname');
+    const declared = portFlag >= 0
+      ? serverEndpointKey(`http://${hostFlag >= 0 ? this.args[hostFlag + 1] : '127.0.0.1'}:${this.args[portFlag + 1]}`)
+      : undefined;
+    const httpsTarget = target.replace(/^https:/, 'http:');
+    return [declared, this.serverEndpoint].some(known => known && (known === target || known === httpsTarget))
+      ? this.serverPassword
+      : undefined;
+  }
+
   public getInfo(): SessionInfo {
     return {
       sessionId: this.id,
@@ -896,6 +933,15 @@ export class SessionManager {
       throw new Error(`Session ${id} not found`);
     }
     return session;
+  }
+
+  /** Password of a running managed server this manager spawned for `url`, if any. */
+  public findServerPassword(url: string): string | undefined {
+    for (const session of this.sessions.values()) {
+      const password = session.serverPasswordFor(url);
+      if (password) return password;
+    }
+    return undefined;
   }
 
   public hasSession(id: string): boolean {
