@@ -793,3 +793,22 @@ esac
   assert.equal(duplicate.json.ok, false);
   assert.equal(duplicate.json.skipped, true);
 });
+
+test('ISS-66: follow-up runs get unique names instead of reusing the agent name', async (t) => {
+  const { bin, dir } = await fakeOpencode(t, `
+printf '{"type":"step_start","sessionID":"ses_followup1234"}\\n'
+`);
+  const client = mcpClient({ OPENCODE_BIN: bin }, dir);
+  t.after(() => client.close());
+  await client.init();
+  const first = await client.call('agent_spawn', { prompt: 'one', cwd: dir, name: 'v-agent-A' });
+  assert.equal(first.json.name, 'v-agent-A');
+  assert.equal((await client.call('session_wait', { sessionId: first.json.sessionId, timeoutMs: 5000 })).json.exitCode, 0);
+  const second = await client.call('agent_send', { sessionId: first.json.sessionId, message: 'two' });
+  assert.equal(second.json.next.name, 'v-agent-A#2');
+  assert.equal((await client.call('session_wait', { sessionId: second.json.next.sessionId, timeoutMs: 5000 })).json.exitCode, 0);
+  const third = await client.call('agent_send', { sessionId: second.json.next.sessionId, message: 'three' });
+  assert.equal(third.json.next.name, 'v-agent-A#3');
+  const names = (await client.call('agent_list', { includeOpencode: false })).json.tracked.map((s) => s.name);
+  assert.equal(new Set(names).size, names.length);
+});

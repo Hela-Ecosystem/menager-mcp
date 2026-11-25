@@ -114,6 +114,20 @@ function envForAttach(attach: string | undefined): Record<string, string> {
   return password ? { ...OPENCODE_ENV, OPENCODE_PASSWORD: password } : OPENCODE_ENV;
 }
 
+/** Follow-up runs get `name#2`, `name#3`, ... so a name identifies one tracked run. */
+function nextRunName(name: string | undefined): string | undefined {
+  if (!name) return undefined;
+  const base = name.replace(/#\d+$/, "");
+  const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const family = new RegExp(`^${escaped}(?:#(\\d+))?$`);
+  let highest = 1;
+  for (const { name: existing } of sessionManager.listSessions()) {
+    const match = existing ? family.exec(existing) : null;
+    if (match) highest = Math.max(highest, match[1] ? Number(match[1]) : 1);
+  }
+  return `${base}#${highest + 1}`.slice(0, 64);
+}
+
 const SERVER_STARTUP_CHECK_MS = 1000;
 
 function resolveAgentSessionId(session: Session): string | null {
@@ -697,7 +711,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const opencodeId = resolveAgentSessionId(session);
         if (!opencodeId) return opencodeFailure("Could not resolve the addressed OpenCode session ID", opencodeResolutionHint(session));
         const runArgs = buildRunArgs({ message, session: opencodeId, model: session.meta.model, agent: session.meta.agent, attach: opencodeAttach(session) });
-        const info = sessionManager.spawn(OPENCODE_BIN, runArgs, session.cwd, envForAttach(opencodeAttach(session)), 5000, "xterm-256color", session.name, undefined, undefined, undefined, {
+        const info = sessionManager.spawn(OPENCODE_BIN, runArgs, session.cwd, envForAttach(opencodeAttach(session)), 5000, "xterm-256color", nextRunName(session.name), undefined, undefined, undefined, {
           kind: "agent", agent: session.meta.agent, model: session.meta.model, dir: session.meta.dir,
           promptPreview: message.slice(0, 200), parentSessionId: sessionId, opencodeSessionId: opencodeId,
           run_id: session.meta.run_id ?? null, step_id: session.meta.step_id ?? null
