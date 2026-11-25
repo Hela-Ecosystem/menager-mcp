@@ -701,6 +701,68 @@ esac
   }
 });
 
+const ATTACH_PASSWORD = 'Zx_9-' + 'abcdefghij'.repeat(3) + 'KLMN';
+
+test('ISS-64: an attached agent receives the spawned server password without it ever being returned', async (t) => {
+  const { bin, dir } = await fakeOpencode(t, `
+case "$1" in
+  serve)
+    printf 'server password %s\\n' '${ATTACH_PASSWORD}'
+    printf 'listening on http://127.0.0.1:47123\\n'
+    exec sleep 30 ;;
+  --server)
+    if [ "$OPENCODE_PASSWORD" != '${ATTACH_PASSWORD}' ]; then
+      printf '{"type":"error","message":"Server at %s requires a password; set OPENCODE_PASSWORD"}\\n' "$2"
+      exit 1
+    fi
+    printf '{"type":"step_start","sessionID":"ses_attach123456"}\\n'
+    exit 0 ;;
+  *) exit 2 ;;
+esac
+`);
+  const client = mcpClient({ OPENCODE_BIN: bin }, dir);
+  t.after(() => client.close());
+  await client.init();
+  const server = await client.call('opencode_server_spawn', { mode: 'serve', port: 47123 });
+  assert.equal(server.isError, false, server.text);
+  const everything = [server.text];
+
+  const attached = await client.call('agent_spawn', { prompt: 'hello', cwd: dir, attach: 'http://127.0.0.1:47123' });
+  assert.equal(attached.isError, false, attached.text);
+  const { sessionId } = attached.json;
+  assert.equal((await client.call('session_wait', { sessionId, timeoutMs: 5000 })).json.exitCode, 0);
+  const info = await client.call('agent_info', { sessionId });
+  assert.equal(info.json.resolvedOpencodeSessionId, 'ses_attach123456');
+  everything.push(attached.text, info.text, (await client.call('session_list', {})).text,
+    (await client.call('session_read', { sessionId: server.json.sessionId })).text);
+
+  const followUp = await client.call('agent_send', { sessionId, message: 'again' });
+  assert.equal(followUp.isError, false, followUp.text);
+  assert.equal((await client.call('session_wait', { sessionId: followUp.json.next.sessionId, timeoutMs: 5000 })).json.exitCode, 0);
+  everything.push(followUp.text);
+
+  const other = await client.call('agent_spawn', { prompt: 'hello', cwd: dir, attach: 'http://127.0.0.1:47999' });
+  assert.equal((await client.call('session_wait', { sessionId: other.json.sessionId, timeoutMs: 5000 })).json.exitCode, 1);
+
+  for (const text of everything) assert.ok(!text.includes(ATTACH_PASSWORD));
+});
+
+test('ISS-64: opencode_server_spawn reports a startup failure instead of status running', async (t) => {
+  const { bin, dir } = await fakeOpencode(t, `
+printf 'port already in use\\n'
+exit 3
+`);
+  const client = mcpClient({ OPENCODE_BIN: bin }, dir);
+  t.after(() => client.close());
+  await client.init();
+  const server = await client.call('opencode_server_spawn', { mode: 'serve' });
+  assert.equal(server.isError, true, server.text);
+  assert.equal(server.json.ok, false);
+  assert.equal(server.json.status, 'exited');
+  assert.equal(server.json.exitCode, 3);
+  assert.match(server.json.output, /port already in use/);
+});
+
 test('ISS-65: opencode_import fails when the session already exists and honours cwd', async (t) => {
   const { bin, dir } = await fakeOpencode(t, `
 printf '%s\\n' "$PWD" >> "$MENAGER_IMPORT_LOG"

@@ -95,8 +95,8 @@ function opencodeFailure(error: string, hint?: string) {
   return { isError: true, content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error, ...(hint && { reason: error, hint }) }) }] };
 }
 
-function runOpencodeSync(args: string[], cwd?: string, timeoutMs = 15000): { ok: boolean; stdout: string; stderr: string; error?: string } {
-  const result = spawnSync(OPENCODE_BIN, args, { cwd: cwd || process.cwd(), timeout: timeoutMs, encoding: "utf-8", shell: false, maxBuffer: 2 * 1024 * 1024, env: OPENCODE_ENV });
+function runOpencodeSync(args: string[], cwd?: string, timeoutMs = 15000, env: Record<string, string> = OPENCODE_ENV): { ok: boolean; stdout: string; stderr: string; error?: string } {
+  const result = spawnSync(OPENCODE_BIN, args, { cwd: cwd || process.cwd(), timeout: timeoutMs, encoding: "utf-8", shell: false, maxBuffer: 2 * 1024 * 1024, env });
   const stdout = result.stdout ?? "";
   const stderr = result.stderr ?? "";
   const usageError = opencodeUsageError(stdout, stderr);
@@ -108,6 +108,14 @@ function opencodeAttach(session: Session): string | undefined {
   return session.args[0] === "--server" ? session.args[1] : undefined;
 }
 
+/** Child env for an OpenCode command; adds the generated password only for a server this cell spawned. */
+function envForAttach(attach: string | undefined): Record<string, string> {
+  const password = attach ? sessionManager.findServerPassword(attach) : undefined;
+  return password ? { ...OPENCODE_ENV, OPENCODE_PASSWORD: password } : OPENCODE_ENV;
+}
+
+const SERVER_STARTUP_CHECK_MS = 1000;
+
 function resolveAgentSessionId(session: Session): string | null {
   const { kind, opencodeSessionId, opencodeLookupTitle } = session.meta;
   if (kind !== "agent") return null;
@@ -118,7 +126,7 @@ function resolveAgentSessionId(session: Session): string | null {
   const attach = opencodeAttach(session);
   if (attach) command.unshift("--server", attach);
   try {
-    const result = runOpencodeSync(command, session.cwd);
+    const result = runOpencodeSync(command, session.cwd, undefined, envForAttach(attach));
     if (!result.ok) return null;
     const rows: unknown = JSON.parse(result.stdout);
     if (!Array.isArray(rows)) return null;
@@ -657,8 +665,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const fmt = format === "default" ? undefined : "json";
         const suffix = fmt === undefined ? ` [menager:${randomUUID()}]` : undefined;
         const opencodeLookupTitle = suffix ? (title || "Agent").slice(0, 120 - suffix.length) + suffix : undefined;
-        const runArgs = buildRunArgs({ message: prompt, model, agent, format: fmt, title: opencodeLookupTitle ?? title, attach: assertServerUrl(attach) });
-        const info = sessionManager.spawn(OPENCODE_BIN, runArgs, cwd, OPENCODE_ENV, 5000, "xterm-256color", name, cols, rows, undefined, {
+        const attachUrl = assertServerUrl(attach);
+        const runArgs = buildRunArgs({ message: prompt, model, agent, format: fmt, title: opencodeLookupTitle ?? title, attach: attachUrl });
+        const info = sessionManager.spawn(OPENCODE_BIN, runArgs, cwd, envForAttach(attachUrl), 5000, "xterm-256color", name, cols, rows, undefined, {
           kind: "agent", agent, model, dir: cwd, title, opencodeLookupTitle,
           promptPreview: prompt.slice(0, 200),
           run_id: typeof run_id === "string" ? run_id : null,
@@ -688,7 +697,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const opencodeId = resolveAgentSessionId(session);
         if (!opencodeId) return opencodeFailure("Could not resolve the addressed OpenCode session ID", opencodeResolutionHint(session));
         const runArgs = buildRunArgs({ message, session: opencodeId, model: session.meta.model, agent: session.meta.agent, attach: opencodeAttach(session) });
-        const info = sessionManager.spawn(OPENCODE_BIN, runArgs, session.cwd, OPENCODE_ENV, 5000, "xterm-256color", session.name, undefined, undefined, undefined, {
+        const info = sessionManager.spawn(OPENCODE_BIN, runArgs, session.cwd, envForAttach(opencodeAttach(session)), 5000, "xterm-256color", session.name, undefined, undefined, undefined, {
           kind: "agent", agent: session.meta.agent, model: session.meta.model, dir: session.meta.dir,
           promptPreview: message.slice(0, 200), parentSessionId: sessionId, opencodeSessionId: opencodeId,
           run_id: session.meta.run_id ?? null, step_id: session.meta.step_id ?? null
@@ -702,7 +711,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const opencodeId = resolveAgentSessionId(session);
         if (!opencodeId) return opencodeFailure("Cannot fork without a resolved OpenCode session ID", opencodeResolutionHint(session));
         const runArgs = buildRunArgs({ message, session: opencodeId, fork: true, model: session.meta.model, agent: session.meta.agent, format: "json", attach: opencodeAttach(session) });
-        const info = sessionManager.spawn(OPENCODE_BIN, runArgs, session.cwd, OPENCODE_ENV, 5000, "xterm-256color", typeof name === "string" ? name : undefined, undefined, undefined, undefined, {
+        const info = sessionManager.spawn(OPENCODE_BIN, runArgs, session.cwd, envForAttach(opencodeAttach(session)), 5000, "xterm-256color", typeof name === "string" ? name : undefined, undefined, undefined, undefined, {
           kind: "agent", agent: session.meta.agent, model: session.meta.model, dir: session.meta.dir,
           promptPreview: message.slice(0, 200), parentSessionId: sessionId,
           run_id: session.meta.run_id ?? null, step_id: session.meta.step_id ?? null
@@ -755,7 +764,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           try {
             const command = ["session", "delete", assertOpencodeSessionId(opencodeSessionId)];
             if (session.args[0] === "--server") command.unshift(...session.args.slice(0, 2));
-            const r = runOpencodeSync(command, session.meta.dir);
+            const r = runOpencodeSync(command, session.meta.dir, undefined, envForAttach(opencodeAttach(session)));
             opencodeSessionDeleted = r.ok;
             reason = r.ok ? undefined : (r.stderr.trim() || r.error || "opencode session delete failed").slice(0, 300);
           } catch (error) {
@@ -846,7 +855,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           a.push("--hostname", hostname);
         }
         const info = sessionManager.spawn(OPENCODE_BIN, a, process.cwd(), OPENCODE_ENV, 5000, "xterm-256color", typeof name === "string" ? name.slice(0, 64) : `opencode-${mode}`, undefined, undefined, undefined, { kind: "pty", promptPreview: `opencode ${a.join(" ")}`.slice(0, 200) }, undefined, { redactServerPassword: true });
-        return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
+        const server = sessionManager.getSession(info.sessionId);
+        await Promise.race([server.exited(), new Promise(done => setTimeout(done, SERVER_STARTUP_CHECK_MS).unref())]);
+        const settled = server.getInfo();
+        if (settled.status !== "running") {
+          return { isError: true, content: [{ type: "text", text: JSON.stringify({
+            ok: false,
+            error: `opencode ${mode} exited during startup (code ${settled.exitCode})`,
+            sessionId: settled.sessionId,
+            status: settled.status,
+            exitCode: settled.exitCode,
+            output: server.getLines(20, true).slice(-2000)
+          }, null, 2) }] };
+        }
+        return { content: [{ type: "text", text: JSON.stringify(settled, null, 2) }] };
       }
       case "opencode_status": {
         const ver = runOpencodeSync(["--version"], undefined, 10000);
