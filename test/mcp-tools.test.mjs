@@ -700,3 +700,34 @@ esac
     await client.close();
   }
 });
+
+test('ISS-65: opencode_import fails when the session already exists and honours cwd', async (t) => {
+  const { bin, dir } = await fakeOpencode(t, `
+printf '%s\\n' "$PWD" >> "$MENAGER_IMPORT_LOG"
+case "$(cat "$MENAGER_IMPORT_LOG" | wc -l | tr -d ' ')" in
+  3) printf 'Session already exists\\n' >&2; exit 0 ;;
+  *) printf 'Imported session ses_imported1234\\n'; exit 0 ;;
+esac
+`);
+  const project = path.join(dir, 'project');
+  await mkdir(project);
+  const log = path.join(dir, 'imports.log');
+  await writeFile(log, '');
+  const client = mcpClient({ OPENCODE_BIN: bin, MENAGER_IMPORT_LOG: log }, dir);
+  t.after(() => client.close());
+  await client.init();
+
+  const imported = await client.call('opencode_import', { file: '/tmp/session.json', cwd: project });
+  assert.equal(imported.isError, false, imported.text);
+  assert.equal(imported.json.ok, true);
+  assert.equal((await readFile(log, 'utf8')).trim(), await (await import('node:fs/promises')).realpath(project));
+
+  const missing = await client.call('opencode_import', { file: '/tmp/session.json', cwd: path.join(dir, 'nope') });
+  assert.equal(missing.isError, true);
+
+  await client.call('opencode_import', { file: '/tmp/session.json' });
+  const duplicate = await client.call('opencode_import', { file: '/tmp/session.json' });
+  assert.equal(duplicate.isError, true, duplicate.text);
+  assert.equal(duplicate.json.ok, false);
+  assert.equal(duplicate.json.skipped, true);
+});

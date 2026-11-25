@@ -8,6 +8,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { statSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { type Session, SessionExitedError, SessionManager } from "./SessionManager.js";
 import { assertOpencodeSessionId, buildStatsArgs, isOpencodeSessionId, opencodeHostEnv, opencodeUsageError } from "./opencode-cli.js";
@@ -464,7 +465,8 @@ const TOOLS: Tool[] = [
     inputSchema: {
       type: "object",
       properties: {
-        file: { type: "string", description: "Absolute path to a session JSON file" }
+        file: { type: "string", description: "Absolute path to a session JSON file" },
+        cwd: { type: "string", description: "Directory to run the import from. OpenCode re-homes the session to this project (defaults to the server's working directory)." }
       },
       required: ["file"]
     }
@@ -806,10 +808,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: "text", text: (r.stdout || r.stderr || r.error || "").slice(0, 20000) }], isError: r.ok ? undefined : true };
       }
       case "opencode_import": {
-        const { file } = args as any;
+        const { file, cwd } = args as any;
         const f = assertSafePath(file, "file");
-        const r = runOpencodeSync(["session", "import", "--", f], undefined, 30000);
-        return { content: [{ type: "text", text: JSON.stringify({ ok: r.ok, stdout: r.stdout.slice(0, 4000), stderr: r.stderr.slice(0, 1000) }, null, 2) }], isError: r.ok ? undefined : true };
+        let dir: string | undefined;
+        if (cwd !== undefined) {
+          dir = resolve(assertSafePath(cwd, "cwd"));
+          if (!statSync(dir, { throwIfNoEntry: false })?.isDirectory()) throw new Error("cwd must be an existing directory");
+        }
+        const r = runOpencodeSync(["session", "import", "--", f], dir, 30000);
+        const skipped = r.ok && /already exists/i.test(`${r.stderr}\n${r.stdout}`);
+        const ok = r.ok && !skipped;
+        return { content: [{ type: "text", text: JSON.stringify({ ok, ...(skipped ? { skipped: true, reason: "session already exists; nothing imported" } : {}), stdout: r.stdout.slice(0, 4000), stderr: r.stderr.slice(0, 1000) }, null, 2) }], isError: ok ? undefined : true };
       }
       case "opencode_session_delete": {
         const sessionId = assertOpencodeSessionId(args?.sessionId);
