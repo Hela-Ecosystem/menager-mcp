@@ -3,6 +3,14 @@
 ### Fixed
 - `session_read` `lines` mode replays carriage-return overwrites when `stripAnsi` is set, so prompt redraws no longer surface as interleaved echo fragments (`<cho MARKER-START; …`) ahead of the real output. `stripAnsi: false` still returns the untouched raw stream. (`menager-mcp#17`)
 
+## [3.2.4] - 2026-11-25
+
+### Fixed
+- `opencode_server_spawn` keeps the generated server password private and sets `OPENCODE_PASSWORD` only for opencode commands that attach to that same server URL (`agent_spawn`, `agent_send`, `agent_fork`, session lookup, delete); it is never returned or logged. Startup is checked once after a fixed 1s window and reports `ok:false` with the exit code when the process died. (`menager-mcp#23` ISS-64)
+- `opencode_server_spawn` result and description now state that `status: running` means alive after the startup window, not ready to accept connections. (`menager-mcp#23` ISS-64)
+- `opencode_import` reports a skipped duplicate session as `ok:false, skipped:true` instead of an empty success, and accepts an optional `cwd` that selects the project the imported session is re-homed to. (`menager-mcp#23` ISS-65)
+- `agent_send` follow-up runs get unique names (`name#2`, `name#3`, ...) so a name identifies one tracked run. (`menager-mcp#23` ISS-66)
+
 ## [3.2.3] - 2026-11-23
 
 ### Fixed

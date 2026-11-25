@@ -536,7 +536,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "opencode_server_spawn",
-    description: "Spawn a long-running opencode server in a managed PTY. Use its URL as the attach input to agent_spawn.",
+    description: "Spawn a long-running opencode server in a managed PTY. Use its URL as the attach input to agent_spawn. Waits a fixed startup window: status running means alive after that window, not ready.",
     inputSchema: {
       type: "object",
       properties: {
@@ -882,7 +882,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             output: server.getLines(20, true).slice(-2000)
           }, null, 2) }] };
         }
-        return { content: [{ type: "text", text: JSON.stringify(settled, null, 2) }] };
+        return { content: [{ type: "text", text: JSON.stringify({
+          ...settled,
+          startupCheck: `status running means the process was still alive after the ${SERVER_STARTUP_CHECK_MS}ms startup window, not that the server is ready to accept connections; a slower start can still fail later, so poll the URL or session_read before attaching.`
+        }, null, 2) }] };
       }
       case "opencode_status": {
         const ver = runOpencodeSync(["--version"], undefined, 10000);

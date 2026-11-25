@@ -725,6 +725,7 @@ esac
   await client.init();
   const server = await client.call('opencode_server_spawn', { mode: 'serve', port: 47123 });
   assert.equal(server.isError, false, server.text);
+  assert.match(server.json.startupCheck, /alive after the 1000ms startup window, not that the server is ready/);
   const everything = [server.text];
 
   const attached = await client.call('agent_spawn', { prompt: 'hello', cwd: dir, attach: 'http://127.0.0.1:47123' });
