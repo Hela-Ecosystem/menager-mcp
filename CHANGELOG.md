@@ -1,8 +1,3 @@
-## [Unreleased]
-
-### Fixed
-- `session_read` `lines` mode replays carriage-return overwrites when `stripAnsi` is set, so prompt redraws no longer surface as interleaved echo fragments (`<cho MARKER-START; …`) ahead of the real output. `stripAnsi: false` still returns the untouched raw stream. (`menager-mcp#17`)
-
 ## [3.2.4] - 2026-11-25
 
 ### Fixed
@@ -77,4 +72,3 @@ Remote rendered PTY. No tools were added or removed — the surface stays at 28 
 
 ### Changed
 - **Version reset to 3.0.0** — per-server version metadata baseline reset (Phase 7). All `package.json`, MCP `ServerInfo.version`, and HTTP metadata now report `3.0.0`. This is a metadata/interface baseline reset; for `hela-plastid` it is not an upgrade from the previous `4.2.0` advert.
-
