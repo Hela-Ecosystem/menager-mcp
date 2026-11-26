@@ -58,7 +58,7 @@ List available models, optionally filtered by provider. Returns up to 50 complet
 
 ## `opencode_server_spawn`
 
-Spawn a long-running opencode server in a managed PTY. Use its URL as the attach input to agent_spawn.
+Spawn a long-running opencode server in a managed PTY. Use its URL as the attach input to agent_spawn. Waits a fixed startup window: status running means alive after that window, not ready.
 
 ## `opencode_session_delete`
 
